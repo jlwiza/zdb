@@ -4,9 +4,9 @@ A lightweight source-level debugger for Zig that works through compile-time prep
 
 ## Why ZDB?
 
-I built this on a whim because I liked how `std.debug.print` just worked a lot better than gdb, windbg, or lldb. You have to install this entire package. the setup can be a pain depending on you're os. after all that, it doesn't know or understand zig. I wanted that same simplicity for debugging, but with the ability to pause execution and inspect program state, since there is no hidden control flow in zig. writing that directly is pretty trivial.
+I built this on a whim because any time I used a debugger with zig, whether it was lldb dgb or windbg, `std.debug.print` was just a lot more powerful. It had larger scope would work better with globals. You have to install this entire package. The setup can be a pain depending on you're OS. I wanted that same simplicity for debugging, but with the ability to pause execution and inspect program state, since there is no hidden control flow in zig, set it up for extensibility.
 
-The approach is almost embarrassingly simple: inject a function call before each line that can pause execution and let you examine all variables in scope - local, global, and thread-local. What surprised me was the performance. Despite zero optimization effort, it runs fast. Really fast. A lot faster than traditional debuggers that context-switch to external processes.
+The approach is almost embarrassingly simple: inject a function call before each line that can pause execution and let you examine all variables in scope - local, global, and thread-local. but, what surprised me was the performance, It's was so fast in fact, at first I thought it was broken. Despite zero optimization effort. Just A lot faster than traditional debuggers that context-switch to external processes.
 
 This started as a weekend experiment to see if Zig's comptime features could make debugging better. In most languages, building something like this would require wrestling with AST parsers, complex build system integrations, or platform-specific debugging APIs. In Zig, the first working version was under 500 lines of straightforward code.
 

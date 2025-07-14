@@ -1,0 +1,30 @@
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# ZDB specific
+processed/
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+
+# Test coverage
+*.coverage
+
+# Debug artifacts
+core
+*.core
+vgcore.*

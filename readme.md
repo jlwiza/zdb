@@ -25,7 +25,6 @@ Add ZDB to your `build.zig.zon`:
 
 ```zig
 .{
-    //TODO::JON Make sure to fill this out correctly. 
     .name = "your-app-name",
     .version = "0.1.0",
     .dependencies = .{

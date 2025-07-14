@@ -1,4 +1,3 @@
-// runtime.zig - Runtime debugging functions
 const std = @import("std");
 
 // Global state for debugging

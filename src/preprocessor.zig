@@ -1,4 +1,3 @@
-// preprocessor.zig - Enhanced with global variable tracking
 const std = @import("std");
 
 // Structure to hold different types of globals

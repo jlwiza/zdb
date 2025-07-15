@@ -30,7 +30,7 @@ Add ZDB to your `build.zig.zon`:
     .dependencies = .{
         .zdb = .{
         .url = "https://github.com/jlwiza/zdb/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "...",
+            .hash = "1220607af37dc440b321b41b0bfcbaf625187a413b31cfcfc793c2c2b5f799d9459f",
         },
     },
 }

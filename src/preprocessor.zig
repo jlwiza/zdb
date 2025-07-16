@@ -60,10 +60,36 @@ pub fn main() !void {
     const needs_debug = has_breakpoints or has_step or enable_step;
 
     if (needs_debug) {
-        // Add imports
-        const has_std_import = std.mem.indexOf(u8, source, "@import(\"std\")") != null;
+        // First, scan for module doc comments
+        var lines_iter = std.mem.splitScalar(u8, source, '\n');
+        var doc_comment_lines = std.ArrayList([]const u8).init(allocator);
+        defer doc_comment_lines.deinit();
 
+        // Collect all module doc comments at the start
+        while (lines_iter.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (std.mem.startsWith(u8, trimmed, "//!")) {
+                try doc_comment_lines.append(line);
+            } else if (trimmed.len > 0) {
+                // Hit first non-doc-comment, non-empty line
+                break;
+            } else if (trimmed.len == 0) {
+                // Empty line - could be part of doc comment block
+                try doc_comment_lines.append(line);
+            }
+        }
+
+        // Add the auto-generated header
         try output.appendSlice("// AUTO-GENERATED - DO NOT EDIT\n");
+
+        // Re-add doc comments if any
+        for (doc_comment_lines.items) |doc_line| {
+            try output.appendSlice(doc_line);
+            try output.append('\n');
+        }
+
+        // Add imports after doc comments
+        const has_std_import = std.mem.indexOf(u8, source, "@import(\"std\")") != null;
         if (!has_std_import) {
             try output.appendSlice("const std = @import(\"std\");\n");
         }
@@ -78,6 +104,30 @@ pub fn main() !void {
         } else {
             // Default for regular files - use module import
             try output.appendSlice("const zdb = @import(\"zdb\");\n\n");
+        }
+
+        // Reset lines iterator to process the rest
+        lines_iter.reset();
+
+        // Skip past the doc comments we already processed
+        var skip_count: usize = 0;
+        while (lines_iter.next()) |line| {
+            skip_count += 1;
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (std.mem.startsWith(u8, trimmed, "//!") or trimmed.len == 0) {
+                continue;
+            } else {
+                // Found first real line, back up one
+                skip_count -= 1;
+                break;
+            }
+        }
+
+        // Now process the rest of the file
+        lines_iter.reset();
+        var skipped: usize = 0;
+        while (lines_iter.next()) |_| : (skipped += 1) {
+            if (skipped >= skip_count) break;
         }
     }
 
@@ -98,12 +148,22 @@ pub fn main() !void {
     var step_mode_active = enable_step or has_step;
     var in_initializer = false;
     var global_brace_count: usize = 0; // Track top-level braces
+    var processed_header = false;
 
     const is_build_file = std.mem.endsWith(u8, input_file, "build.zig");
 
     while (lines.next()) |line| {
         line_number += 1;
         const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Skip doc comments and empty lines at the start if we've already processed them
+        if (needs_debug and !processed_header) {
+            if (std.mem.startsWith(u8, trimmed, "//!") or (trimmed.len == 0 and line_number <= 10)) {
+                continue;
+            } else {
+                processed_header = true;
+            }
+        }
 
         // Track global brace count
         for (trimmed) |c| {

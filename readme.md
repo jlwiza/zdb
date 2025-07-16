@@ -24,29 +24,42 @@ This started as a weekend experiment to see if Zig's comptime features could mak
 Add ZDB to your `build.zig.zon`:
 
 ```zig
-.{
-    .name = "your-app-name",
-    .version = "0.1.0",
-    .dependencies = .{
-        .zdb = .{
-        .url = "https://github.com/jlwiza/zdb/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "1220607af37dc440b321b41b0bfcbaf625187a413b31cfcfc793c2c2b5f799d9459f",
-        },
+.dependencies = .{
+    .zdb = .{
+        .url = "https://github.com/jlwiza/zdb/archive/refs/tags/v0.1.4.tar.gz",
+        .hash = "1220147830bb627d78863a1d6b02680587b67d271afaafb79c7114c77449ac3dc132",
     },
-}
+},
 ```
 
-Then add one line to your `build.zig`:
+Add to your build.zig:
 
 ```zig
 const std = @import("std");
 const zdb = @import("zdb");
 
-pub fn build(b: *std.Build) !void {
-    // ... your normal build setup ...
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const exe = b.addExecutable(.{
+        .name = "my-app",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Step 1: Add ZDB module to your executable
+    const zdb_dep = b.dependency("zdb", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("zdb", zdb_dep.module("zdb"));
     
-    // Add debugging support
+    // Step 2: Add debug command
     zdb.addTo(b, exe, .{});
+
+    b.installArtifact(exe);
 }
 ```
 

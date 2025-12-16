@@ -7,11 +7,25 @@ pub var step_functions: [32]?[]const u8 = [_]?[]const u8{null} ** 32;
 pub var step_function_count: usize = 0;
 var watch_expressions: []const WatchExpr = &.{};
 var breakpoint_count: usize = 0;
-var last_breakpoint_time: ?i64 = null;
+var last_breakpoint_time: ?std.time.Instant = null;
+
+pub var runtime: Runtime = .{};
 
 const WatchExpr = struct {
     name: []const u8,
     check_fn: *const fn () bool,
+};
+
+pub const Runtime = struct {
+    threaded: std.Io.Threaded = .init_single_threaded,
+
+    pub fn deinit(self: *Runtime) void {
+        self.threaded.deinit();
+    }
+
+    pub fn io(self: *Runtime) std.Io {
+        return self.threaded.io();
+    }
 };
 
 // Check if we should step in the current function
@@ -342,12 +356,14 @@ pub fn handleBreakpoint(
     breakpoint_count += 1;
 
     // Time tracking
-    const current_time = std.time.milliTimestamp();
-    if (last_breakpoint_time) |last_time| {
-        const elapsed = current_time - last_time;
-        std.debug.print("\n[Time since last breakpoint: {}ms]\n", .{elapsed});
+    const now = std.time.Instant.now() catch return;
+    if (last_breakpoint_time) |last| {
+        const elapsed_ns = now.since(last);
+        std.debug.print("\n[Time since last breakpoint: {}ms]\n", .{
+            elapsed_ns / std.time.ns_per_ms,
+        });
     }
-    last_breakpoint_time = current_time;
+    last_breakpoint_time = now;
 
     // Check if we're in a build.zig context
     const is_build_context = std.mem.eql(u8, function_name, "build");
@@ -368,8 +384,10 @@ pub fn handleBreakpoint(
     }
 
     // Normal interactive mode for non-build contexts
-    const stdin = std.io.getStdIn().reader();
-    var buf: [256]u8 = undefined;
+    const io = runtime.io();
+    var stdin_buf: [256]u8 = undefined;
+    var stdin_reader = std.fs.File.stdin().reader(io, stdin_buf[0..]);
+    const r = &stdin_reader.interface;
     var last_array_name: []const u8 = "";
     var last_array_page: usize = 0;
 
@@ -384,13 +402,13 @@ pub fn handleBreakpoint(
     while (true) {
         std.debug.print("> ", .{});
         // Add debug output to see what's happening
-        const result = stdin.readUntilDelimiterOrEof(&buf, '\n') catch |err| {
+        const maybe_line = r.takeDelimiter('\n') catch |err| {
             std.debug.print("Error reading stdin: {}\n", .{err});
             break;
         };
 
-        if (result) |input| {
-            const cmd = std.mem.trim(u8, input, " \t\r\n");
+        if (maybe_line) |input_including_nl| {
+            const cmd = std.mem.trim(u8, input_including_nl, " \t\r\n");
 
             if (std.mem.eql(u8, cmd, "c")) {
                 break;
@@ -463,7 +481,7 @@ pub fn handleBreakpoint(
             if (!handled) {
                 std.debug.print("Unknown command or variable\n", .{});
             }
-        }
+        } else break;
     }
 }
 
@@ -484,12 +502,14 @@ pub fn handleStepBefore(
     std.debug.print("\n[{s}:{d}] about to execute: {s}\n", .{ function_name, line_number, next_line });
     std.debug.print("(s=step, c=continue, n=next, v=vars, or variable name)\n", .{});
 
-    const stdin = std.io.getStdIn().reader();
-    var buf: [256]u8 = undefined;
+    const io = runtime.io();
+    var stdin_buf: [256]u8 = undefined;
+    var stdin_reader = std.fs.File.stdin().reader(io, stdin_buf[0..]);
+    const r = &stdin_reader.interface;
 
     while (true) {
         std.debug.print("step> ", .{});
-        if (stdin.readUntilDelimiterOrEof(&buf, '\n') catch null) |input| {
+        if (r.takeDelimiter('\n') catch null) |input| {
             const cmd = std.mem.trim(u8, input, " \t\r\n");
 
             if (std.mem.eql(u8, cmd, "s") or cmd.len == 0) {
@@ -544,12 +564,14 @@ pub fn handleStep(
     std.debug.print("\n[{s}:{d}] executed: {s}\n", .{ function_name, line_number, executed_line });
     std.debug.print("(s=step, c=continue, n=next (skip calls), v=vars, or variable name)\n", .{});
 
-    const stdin = std.io.getStdIn().reader();
-    var buf: [256]u8 = undefined;
+    const io = runtime.io();
+    var stdin_buf: [256]u8 = undefined;
+    var stdin_reader = std.fs.File.stdin().reader(io, stdin_buf[0..]);
+    const r = &stdin_reader.interface;
 
     while (true) {
         std.debug.print("step> ", .{});
-        if (stdin.readUntilDelimiterOrEof(&buf, '\n') catch null) |input| {
+        if (r.takeDelimiter('\n') catch null) |input| {
             const cmd = std.mem.trim(u8, input, " \t\r\n");
 
             if (std.mem.eql(u8, cmd, "s") or cmd.len == 0) {

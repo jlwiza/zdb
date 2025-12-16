@@ -48,11 +48,12 @@ pub fn main() !void {
         };
     }
 
-    const source = try std.fs.cwd().readFileAlloc(allocator, input_file, 10 * 1024 * 1024);
+    const source = try std.fs.cwd().readFileAlloc(input_file, allocator, .limited(10 * 1024 * 1024));
+    // const source = try std.fs.cwd().readFileAlloc(allocator, input_file, 10 * 1024 * 1024);
     defer allocator.free(source);
 
-    var output = std.ArrayList(u8).init(allocator);
-    defer output.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
 
     // Check if file needs preprocessing
     const has_breakpoints = std.mem.indexOf(u8, source, "_ = .breakpoint;") != null;
@@ -62,48 +63,48 @@ pub fn main() !void {
     if (needs_debug) {
         // First, scan for module doc comments
         var lines_iter = std.mem.splitScalar(u8, source, '\n');
-        var doc_comment_lines = std.ArrayList([]const u8).init(allocator);
-        defer doc_comment_lines.deinit();
+        var doc_comment_lines: std.ArrayList([]const u8) = .empty;
+        defer doc_comment_lines.deinit(allocator);
 
         // Collect all module doc comments at the start
         while (lines_iter.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (std.mem.startsWith(u8, trimmed, "//!")) {
-                try doc_comment_lines.append(line);
+                try doc_comment_lines.append(allocator, line);
             } else if (trimmed.len > 0) {
                 // Hit first non-doc-comment, non-empty line
                 break;
             } else if (trimmed.len == 0) {
                 // Empty line - could be part of doc comment block
-                try doc_comment_lines.append(line);
+                try doc_comment_lines.append(allocator, line);
             }
         }
 
         // Add the auto-generated header
-        try output.appendSlice("// AUTO-GENERATED - DO NOT EDIT\n");
+        try output.appendSlice(allocator, "// AUTO-GENERATED - DO NOT EDIT\n");
 
         // Re-add doc comments if any
         for (doc_comment_lines.items) |doc_line| {
-            try output.appendSlice(doc_line);
-            try output.append('\n');
+            try output.appendSlice(allocator, doc_line);
+            try output.append(allocator, '\n');
         }
 
         // Add imports after doc comments
         const has_std_import = std.mem.indexOf(u8, source, "@import(\"std\")") != null;
         if (!has_std_import) {
-            try output.appendSlice("const std = @import(\"std\");\n");
+            try output.appendSlice(allocator, "const std = @import(\"std\");\n");
         }
 
         // Determine the import path for zdb runtime
         if (runtime_path) |path| {
             // Explicit runtime path provided
-            try output.writer().print("const zdb = @import(\"{s}\");\n\n", .{path});
+            try output.print(allocator, "const zdb = @import(\"{s}\");\n\n", .{path});
         } else if (std.mem.endsWith(u8, input_file, "build.zig")) {
             // For build.zig - use a special marker that we'll handle differently
-            try output.appendSlice("const zdb = @import(\"zdb\"); // SPECIAL:BUILD_FILE\n\n");
+            try output.appendSlice(allocator, "const zdb = @import(\"zdb\"); // SPECIAL:BUILD_FILE\n\n");
         } else {
             // Default for regular files - use module import
-            try output.appendSlice("const zdb = @import(\"zdb\");\n\n");
+            try output.appendSlice(allocator, "const zdb = @import(\"zdb\");\n\n");
         }
 
         // Reset lines iterator to process the rest
@@ -133,12 +134,12 @@ pub fn main() !void {
 
     // Process the source line by line
     var lines = std.mem.splitScalar(u8, source, '\n');
-    var vars_in_scope = std.ArrayList([]const u8).init(allocator);
-    defer vars_in_scope.deinit();
+    var vars_in_scope: std.ArrayList([]const u8) = .empty;
+    defer vars_in_scope.deinit(allocator);
 
     // Track globals
-    var globals_in_file = std.ArrayList(GlobalVar).init(allocator);
-    defer globals_in_file.deinit();
+    var globals_in_file: std.ArrayList(GlobalVar) = .empty;
+    defer globals_in_file.deinit(allocator);
 
     var in_function = false;
     var current_function: []const u8 = "";
@@ -176,7 +177,7 @@ pub fn main() !void {
             // Thread-local variables
             if (std.mem.startsWith(u8, trimmed, "threadlocal var ")) {
                 if (parseVarNameFrom(trimmed, "threadlocal var ")) |var_name| {
-                    try globals_in_file.append(.{
+                    try globals_in_file.append(allocator, .{
                         .name = try allocator.dupe(u8, var_name),
                         .var_type = .thread_local,
                     });
@@ -185,7 +186,7 @@ pub fn main() !void {
             // Regular globals
             else if (std.mem.startsWith(u8, trimmed, "var ")) {
                 if (parseVarName(trimmed)) |var_name| {
-                    try globals_in_file.append(.{
+                    try globals_in_file.append(allocator, .{
                         .name = try allocator.dupe(u8, var_name),
                         .var_type = .regular,
                     });
@@ -194,7 +195,7 @@ pub fn main() !void {
             // Public variables
             else if (std.mem.startsWith(u8, trimmed, "pub var ")) {
                 if (parseVarNameFrom(trimmed, "pub var ")) |var_name| {
-                    try globals_in_file.append(.{
+                    try globals_in_file.append(allocator, .{
                         .name = try allocator.dupe(u8, var_name),
                         .var_type = .pub_var,
                     });
@@ -205,7 +206,7 @@ pub fn main() !void {
                 if (parseVarName(trimmed)) |var_name| {
                     // Check if it's a comptime block
                     const is_comptime = std.mem.indexOf(u8, trimmed, "comptime") != null;
-                    try globals_in_file.append(.{
+                    try globals_in_file.append(allocator, .{
                         .name = try allocator.dupe(u8, var_name),
                         .var_type = if (is_comptime) .comptime_const else .regular,
                     });
@@ -214,7 +215,7 @@ pub fn main() !void {
             // Public constants
             else if (std.mem.startsWith(u8, trimmed, "pub const ")) {
                 if (parseVarNameFrom(trimmed, "pub const ")) |var_name| {
-                    try globals_in_file.append(.{
+                    try globals_in_file.append(allocator, .{
                         .name = try allocator.dupe(u8, var_name),
                         .var_type = .pub_const,
                     });
@@ -238,13 +239,13 @@ pub fn main() !void {
                         const path = after_path[0..quote_end];
                         // If it's a relative path (not absolute), prepend ../
                         if (!std.mem.startsWith(u8, path, "/") and !std.mem.startsWith(u8, path, "../")) {
-                            var new_line = std.ArrayList(u8).init(allocator);
-                            defer new_line.deinit();
-                            try new_line.appendSlice(line_copy[0 .. pos + 8]);
-                            try new_line.appendSlice("../");
-                            try new_line.appendSlice(line_copy[pos + 8 ..]);
+                            var new_line: std.ArrayList(u8) = .empty;
+                            defer new_line.deinit(allocator);
+                            try new_line.appendSlice(allocator, line_copy[0 .. pos + 8]);
+                            try new_line.appendSlice(allocator, "../");
+                            try new_line.appendSlice(allocator, line_copy[pos + 8 ..]);
                             allocator.free(line_copy);
-                            line_copy = try new_line.toOwnedSlice();
+                            line_copy = try new_line.toOwnedSlice(allocator);
                             modified_line = true;
                             pos = pos + 8 + 3 + quote_end + 1; // Skip past this occurrence
                         } else {
@@ -257,8 +258,8 @@ pub fn main() !void {
             }
 
             if (modified_line) {
-                try output.appendSlice(line_copy);
-                try output.append('\n');
+                try output.appendSlice(allocator, line_copy);
+                try output.append(allocator, '\n');
                 continue;
             }
         }
@@ -274,8 +275,8 @@ pub fn main() !void {
                     // Special handling for build.zig files
                     if (is_build_file and std.mem.endsWith(u8, import_path, ".zig")) {
                         // Don't rewrite imports in build.zig - they should reference the original files
-                        try output.appendSlice(line);
-                        try output.append('\n');
+                        try output.appendSlice(allocator, line);
+                        try output.append(allocator, '\n');
                         continue;
                     }
 
@@ -283,10 +284,10 @@ pub fn main() !void {
                         !std.mem.startsWith(u8, import_path, "std") and
                         !std.mem.eql(u8, import_path, "debug_runtime.zig"))
                     {
-                        try output.appendSlice(line[0 .. import_start + 8 + quote_start + 1]);
-                        try output.appendSlice(import_path);
-                        try output.appendSlice(after_import[path_start + path_end ..]);
-                        try output.append('\n');
+                        try output.appendSlice(allocator, line[0 .. import_start + 8 + quote_start + 1]);
+                        try output.appendSlice(allocator, import_path);
+                        try output.appendSlice(allocator, after_import[path_start + path_end ..]);
+                        try output.append(allocator, '\n');
                         continue;
                     }
                 }
@@ -337,11 +338,11 @@ pub fn main() !void {
         // Handle _ = .breakpoint; syntax
         if (std.mem.indexOf(u8, trimmed, "_ = .breakpoint;")) |_| {
             if (needs_debug) {
-                try injectBreakpoint(&output, current_function, &vars_in_scope, &globals_in_file, indent_level);
+                try injectBreakpoint(allocator, &output, current_function, &vars_in_scope, &globals_in_file, indent_level);
             } else {
                 // In non-debug mode, replace with a comment
-                try output.appendSlice(line[0 .. line.len - trimmed.len]); // preserve indentation
-                try output.appendSlice("// _ = .breakpoint; - disabled in non-debug mode\n");
+                try output.appendSlice(allocator, line[0 .. line.len - trimmed.len]); // preserve indentation
+                try output.appendSlice(allocator, "// _ = .breakpoint; - disabled in non-debug mode\n");
             }
             continue;
         }
@@ -361,7 +362,7 @@ pub fn main() !void {
 
         // Inject step debugging
         if (needs_debug and in_function and !in_initializer and shouldInjectStep(trimmed)) {
-            try injectStepDebugBefore(&output, current_function, trimmed, line_number, &vars_in_scope, &globals_in_file, indent_level);
+            try injectStepDebugBefore(allocator, &output, current_function, trimmed, line_number, &vars_in_scope, &globals_in_file, indent_level);
         }
 
         // Check if this is a discard of a tracked variable
@@ -389,14 +390,14 @@ pub fn main() !void {
 
         // Copy the original line UNLESS it's a discard of a tracked variable
         if (!is_tracked_discard) {
-            try output.appendSlice(line);
-            try output.append('\n');
+            try output.appendSlice(allocator, line);
+            try output.append(allocator, '\n');
         }
 
         // Track variables AFTER the line is output
         if (in_function and brace_count == 1 and (std.mem.startsWith(u8, trimmed, "var ") or std.mem.startsWith(u8, trimmed, "const "))) {
             if (parseVarName(trimmed)) |var_name| {
-                try vars_in_scope.append(try allocator.dupe(u8, var_name));
+                try vars_in_scope.append(allocator, try allocator.dupe(u8, var_name));
             }
         }
     }
@@ -429,6 +430,7 @@ fn shouldInjectStep(line: []const u8) bool {
 }
 
 fn injectBreakpoint(
+    allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
     function_name: []const u8,
     vars_in_scope: *std.ArrayList([]const u8),
@@ -438,57 +440,58 @@ fn injectBreakpoint(
     const indent = "    " ** 16;
     const actual_indent = indent[0..(indent_level * 4)];
 
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("{\n");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "{\n");
 
     // Build variable names - just the names, no annotations
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("    const var_names = [_][]const u8{");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "    const var_names = [_][]const u8{");
 
     // Local variables
     for (vars_in_scope.items, 0..) |v, i| {
-        if (i > 0) try output.appendSlice(", ");
-        try output.writer().print("\"{s}\"", .{v});
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.print(allocator, "\"{s}\"", .{v});
     }
 
     // Global variables - just names
     if (vars_in_scope.items.len > 0 and globals.items.len > 0) {
-        try output.appendSlice(", ");
+        try output.appendSlice(allocator, ", ");
     }
     for (globals.items, 0..) |g, i| {
-        if (i > 0) try output.appendSlice(", ");
-        try output.writer().print("\"{s}\"", .{g.name});
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.print(allocator, "\"{s}\"", .{g.name});
     }
-    try output.appendSlice("};\n");
+    try output.appendSlice(allocator, "};\n");
 
     // Build variable values
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("    const var_values = .{");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "    const var_values = .{");
 
     // Local values
     for (vars_in_scope.items, 0..) |v, i| {
-        if (i > 0) try output.appendSlice(", ");
-        try output.appendSlice(v);
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, v);
     }
 
     // Global values
     if (vars_in_scope.items.len > 0 and globals.items.len > 0) {
-        try output.appendSlice(", ");
+        try output.appendSlice(allocator, ", ");
     }
     for (globals.items, 0..) |g, i| {
-        if (i > 0) try output.appendSlice(", ");
-        try output.appendSlice(g.name);
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, g.name);
     }
-    try output.appendSlice("};\n");
+    try output.appendSlice(allocator, "};\n");
 
-    try output.appendSlice(actual_indent);
-    try output.writer().print("    zdb.handleBreakpoint(\"{s}\", &var_names, var_values);\n", .{function_name});
+    try output.appendSlice(allocator, actual_indent);
+    try output.print(allocator, "    zdb.handleBreakpoint(\"{s}\", &var_names, var_values);\n", .{function_name});
 
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("}\n");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "}\n");
 }
 
 fn injectStepDebugBefore(
+    allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
     function_name: []const u8,
     next_line: []const u8,
@@ -500,68 +503,68 @@ fn injectStepDebugBefore(
     const indent = "    " ** 16;
     const actual_indent = indent[0..(indent_level * 4)];
 
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("{\n");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "{\n");
 
     // Build variable info - just names
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("    const var_names = [_][]const u8{");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "    const var_names = [_][]const u8{");
 
     for (vars_in_scope.items, 0..) |v, i| {
-        if (i > 0) try output.appendSlice(", ");
-        try output.writer().print("\"{s}\"", .{v});
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.print(allocator, "\"{s}\"", .{v});
     }
 
     if (vars_in_scope.items.len > 0 and globals.items.len > 0) {
-        try output.appendSlice(", ");
+        try output.appendSlice(allocator, ", ");
     }
 
     for (globals.items, 0..) |g, i| {
-        if (i > 0) try output.appendSlice(", ");
-        try output.writer().print("\"{s}\"", .{g.name});
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.print(allocator, "\"{s}\"", .{g.name});
     }
-    try output.appendSlice("};\n");
+    try output.appendSlice(allocator, "};\n");
 
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("    const var_values = .{");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "    const var_values = .{");
 
     for (vars_in_scope.items, 0..) |v, i| {
-        if (i > 0) try output.appendSlice(", ");
-        try output.appendSlice(v);
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, v);
     }
 
     if (vars_in_scope.items.len > 0 and globals.items.len > 0) {
-        try output.appendSlice(", ");
+        try output.appendSlice(allocator, ", ");
     }
 
     for (globals.items, 0..) |g, i| {
-        if (i > 0) try output.appendSlice(", ");
-        try output.appendSlice(g.name);
+        if (i > 0) try output.appendSlice(allocator, ", ");
+        try output.appendSlice(allocator, g.name);
     }
-    try output.appendSlice("};\n");
+    try output.appendSlice(allocator, "};\n");
 
     // Call handleStepBefore
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("    zdb.handleStepBefore(\"");
-    try output.appendSlice(function_name);
-    try output.appendSlice("\", \"");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "    zdb.handleStepBefore(\"");
+    try output.appendSlice(allocator, function_name);
+    try output.appendSlice(allocator, "\", \"");
 
     // Escape special characters
     for (next_line) |c| {
         switch (c) {
-            '"' => try output.appendSlice("\\\""),
-            '\\' => try output.appendSlice("\\\\"),
-            '\n' => try output.appendSlice("\\n"),
-            '\r' => try output.appendSlice("\\r"),
-            '\t' => try output.appendSlice("\\t"),
-            else => try output.append(c),
+            '"' => try output.appendSlice(allocator, "\\\""),
+            '\\' => try output.appendSlice(allocator, "\\\\"),
+            '\n' => try output.appendSlice(allocator, "\\n"),
+            '\r' => try output.appendSlice(allocator, "\\r"),
+            '\t' => try output.appendSlice(allocator, "\\t"),
+            else => try output.append(allocator, c),
         }
     }
 
-    try output.writer().print("\", {}, &var_names, var_values);\n", .{line_number});
+    try output.print(allocator, "\", {}, &var_names, var_values);\n", .{line_number});
 
-    try output.appendSlice(actual_indent);
-    try output.appendSlice("}\n");
+    try output.appendSlice(allocator, actual_indent);
+    try output.appendSlice(allocator, "}\n");
 }
 
 fn parseVarName(line: []const u8) ?[]const u8 {

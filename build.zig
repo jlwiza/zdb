@@ -13,11 +13,12 @@ pub fn build(b: *std.Build) void {
     // The preprocessor tool
     const preprocessor = b.addExecutable(.{
         .name = "zdb-preprocessor",
-        .root_source_file = b.path("src/preprocessor.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/preprocessor.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
-
     // Add runtime module to preprocessor so it can reference types if needed
     preprocessor.root_module.addImport("zdb", zdb_module);
 
@@ -26,9 +27,11 @@ pub fn build(b: *std.Build) void {
 
     // Unit tests
     const lib_tests = b.addTest(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     const test_step = b.step("test", "Run library tests");
@@ -37,9 +40,11 @@ pub fn build(b: *std.Build) void {
     // Test executable for development
     const test_exe = b.addExecutable(.{
         .name = "test-zdb",
-        .root_source_file = b.path("test/test_program.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/test_program.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     _ = .breakpoint;
@@ -79,9 +84,11 @@ pub fn build(b: *std.Build) void {
     // Build debug version
     const test_debug = b.addExecutable(.{
         .name = "test-zdb-debug",
-        .root_source_file = b.path("processed/test/test_program.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("processed/test/test_program.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     test_debug.root_module.addImport("zdb", zdb_module);

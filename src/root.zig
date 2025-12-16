@@ -2,7 +2,18 @@
 //! A lightweight debugging library for Zig
 const std = @import("std");
 // Re-export all the runtime debugging functions
-pub usingnamespace @import("runtime.zig");
+const runtime = @import("runtime.zig");
+pub const breakpoint = runtime.breakpoint;
+pub const debugPrint = runtime.debugPrint;
+pub const debugPrintWithPage = runtime.debugPrintWithPage;
+pub const debugPrintRange = runtime.debugPrintRange;
+
+pub const handleBreakpoint = runtime.handleBreakpoint;
+pub const handleStepBefore = runtime.handleStepBefore;
+pub const handleStep = runtime.handleStep;
+
+pub const addWatch = runtime.addWatch;
+pub const checkWatches = runtime.checkWatches;
 // Build helper function that users call from their build.zig
 pub fn addTo(
     b: *std.Build,

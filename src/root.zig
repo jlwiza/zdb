@@ -35,7 +35,7 @@ pub fn addTo(
     // Get our preprocessor
     const preprocessor = zdb_dep.artifact("zdb-preprocessor");
     // Check if build.zig needs preprocessing
-    const build_content = std.fs.cwd().readFileAlloc(b.allocator, "build.zig", 10 * 1024 * 1024) catch "";
+    const build_content = std.fs.cwd().readFileAlloc("build.zig", b.allocator, .limited(10 * 1024 * 1024)) catch "";
     defer b.allocator.free(build_content);
     if (std.mem.indexOf(u8, build_content, "_ = .breakpoint;") != null) {
         // Create processed directory for build.zig
@@ -102,9 +102,11 @@ pub fn addTo(
     // Build debug exe
     const exe_debug = b.addExecutable(.{
         .name = b.fmt("{s}-debug", .{exe.name}),
-        .root_source_file = b.path(processed_path),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(processed_path),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     exe_debug.root_module.addImport("zdb", zdb_dep.module("zdb"));
     exe_debug.step.dependOn(&preprocess_main.step);

@@ -105,6 +105,52 @@ pub fn build(b: *std.Build) void {
     // Debug build.zig itself (for testing)
     const debug_build_step = b.step("debug-build", "Debug this build.zig");
 
+    // -----------------------------
+    // Test fixture (consumer-style) debug
+    // -----------------------------
+    const fixture_debug_step = b.step("test-fixture-debug", "Debug the test-fixture project");
+
+    // Make processed output directories
+    const make_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "processed/test-fixture/src" });
+
+    // Preprocess fixture sources (add more files if you have them)
+    const fixture_files = [_][]const u8{
+        "test-fixture/src/main.zig",
+        // "test-fixture/src/test_fixture.zig", // if you have it
+    };
+
+    var fixture_last = &make_fixture_dirs.step;
+    for (fixture_files) |file| {
+        const p = b.addRunArtifact(preprocessor);
+        p.addArg(b.fmt("{s}/{s}", .{ base_path, file }));
+        p.addArg(b.fmt("processed/{s}", .{file}));
+        p.step.dependOn(fixture_last);
+        fixture_last = &p.step;
+    }
+
+    // Build the processed fixture exe
+    const fixture_exe = b.addExecutable(.{
+        .name = "test-fixture-debug",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("processed/test-fixture/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // The fixture needs zdb imported
+    fixture_exe.root_module.addImport("zdb", zdb_module);
+
+    // If your fixture code has `const test_fixture = @import("test_fixture");`
+    // then you MUST provide that module name here (see next section).
+    // fixture_exe.root_module.addImport("test_fixture", b.addModule("test_fixture", .{
+    //     .root_source_file = b.path("test-fixture/src/test_fixture.zig"),
+    // }));
+
+    fixture_exe.step.dependOn(fixture_last);
+
+    const run_fixture = b.addRunArtifact(fixture_exe);
+    fixture_debug_step.dependOn(&run_fixture.step);
     // Create processed directory
     const make_processed_dir = b.addSystemCommand(&.{ "mkdir", "-p", "processed" });
 

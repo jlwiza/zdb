@@ -113,10 +113,10 @@ pub fn build(b: *std.Build) void {
     // Make processed output directories
     const make_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "processed/test-fixture/src" });
 
-    // Preprocess fixture sources (add more files if you have them)
+    // Preprocess fixture sources
     const fixture_files = [_][]const u8{
         "test-fixture/src/main.zig",
-        // "test-fixture/src/test_fixture.zig", // if you have it
+        // add more fixture source files here if you want them preprocessed too
     };
 
     var fixture_last = &make_fixture_dirs.step;
@@ -128,6 +128,16 @@ pub fn build(b: *std.Build) void {
         fixture_last = &p.step;
     }
 
+    // IMPORTANT: Define the fixture package module exactly like `zig init` does.
+    // This is what makes `@import("test_fixture")` work.
+    const fixture_pkg_mod = b.addModule("test_fixture", .{
+        // Use src/root.zig if you have it; otherwise point at whatever file
+        // the package wants consumers to import.
+        .root_source_file = b.path("test-fixture/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Build the processed fixture exe
     const fixture_exe = b.addExecutable(.{
         .name = "test-fixture-debug",
@@ -135,17 +145,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("processed/test-fixture/src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "test_fixture", .module = fixture_pkg_mod },
+                .{ .name = "zdb", .module = zdb_module },
+            },
         }),
     });
-
-    // The fixture needs zdb imported
-    fixture_exe.root_module.addImport("zdb", zdb_module);
-
-    // If your fixture code has `const test_fixture = @import("test_fixture");`
-    // then you MUST provide that module name here (see next section).
-    // fixture_exe.root_module.addImport("test_fixture", b.addModule("test_fixture", .{
-    //     .root_source_file = b.path("test-fixture/src/test_fixture.zig"),
-    // }));
 
     fixture_exe.step.dependOn(fixture_last);
 

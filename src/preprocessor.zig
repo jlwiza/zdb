@@ -1,4 +1,6 @@
 const std = @import("std");
+const Io = std.Io;
+const Permissions = std.Io.File.Permissions;
 
 // Structure to hold different types of globals
 const GlobalVar = struct {
@@ -12,14 +14,22 @@ const GlobalVar = struct {
     },
 };
 
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init.Minimal) !u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{
+        .environ = init.environ,
+        .argv0 = .init(init.args),
+    });
+
+    defer threaded.deinit();
+    const io = threaded.ioBasic();
+    const args = try init.args.toSlice(allocator);
 
     if (args.len < 3) {
         std.debug.print("Usage: preprocessor input.zig output.zig [--step] [--runtime-path <path>]\n", .{});
-        return;
+        return 2; // common "bad args" exit code
     }
 
     const input_file = args[1];
@@ -40,7 +50,7 @@ pub fn main() !void {
 
     // Ensure output directory exists
     if (std.fs.path.dirname(output_file)) |dir| {
-        std.fs.cwd().makePath(dir) catch |err| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
             switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
@@ -48,7 +58,7 @@ pub fn main() !void {
         };
     }
 
-    const source = try std.fs.cwd().readFileAlloc(input_file, allocator, .limited(10 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, input_file, allocator, .limited(10 * 1024 * 1024));
     // const source = try std.fs.cwd().readFileAlloc(allocator, input_file, 10 * 1024 * 1024);
     defer allocator.free(source);
 
@@ -402,7 +412,7 @@ pub fn main() !void {
         }
     }
 
-    try std.fs.cwd().writeFile(.{
+    try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = output_file,
         .data = output.items,
     });
@@ -412,6 +422,7 @@ pub fn main() !void {
     } else {
         std.debug.print("Preprocessed {s} -> {s} ({} globals found)\n", .{ input_file, output_file, globals_in_file.items.len });
     }
+    return 0;
 }
 
 fn shouldInjectStep(line: []const u8) bool {

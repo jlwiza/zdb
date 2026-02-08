@@ -1,5 +1,5 @@
 const std = @import("std");
-
+const Timer = @import("util_timer.zig").Timer;
 // Global state for debugging
 pub var step_mode: bool = false;
 // FIXED: Now using a stack of functions instead of single function
@@ -7,7 +7,7 @@ pub var step_functions: [32]?[]const u8 = [_]?[]const u8{null} ** 32;
 pub var step_function_count: usize = 0;
 var watch_expressions: []const WatchExpr = &.{};
 var breakpoint_count: usize = 0;
-var last_breakpoint_time: ?std.time.Instant = null;
+var breakpoint_timer: ?Timer = null;
 
 pub var runtime: Runtime = .{};
 
@@ -356,15 +356,13 @@ pub fn handleBreakpoint(
     breakpoint_count += 1;
 
     // Time tracking
-    const now = std.time.Instant.now() catch return;
-    if (last_breakpoint_time) |last| {
-        const elapsed_ns = now.since(last);
+    if (breakpoint_timer) |last| {
+        const elapsed_ns = last.read();
         std.debug.print("\n[Time since last breakpoint: {}ms]\n", .{
             elapsed_ns / std.time.ns_per_ms,
         });
     }
-    last_breakpoint_time = now;
-
+    breakpoint_timer = Timer.start() catch null;
     // Check if we're in a build.zig context
     const is_build_context = std.mem.eql(u8, function_name, "build");
 
@@ -386,7 +384,7 @@ pub fn handleBreakpoint(
     // Normal interactive mode for non-build contexts
     const io = runtime.io();
     var stdin_buf: [256]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(io, stdin_buf[0..]);
+    var stdin_reader = std.Io.File.stdin().reader(io, stdin_buf[0..]);
     const r = &stdin_reader.interface;
     var last_array_name: []const u8 = "";
     var last_array_page: usize = 0;
@@ -504,7 +502,7 @@ pub fn handleStepBefore(
 
     const io = runtime.io();
     var stdin_buf: [256]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(io, stdin_buf[0..]);
+    var stdin_reader = std.Io.File.stdin().reader(io, stdin_buf[0..]);
     const r = &stdin_reader.interface;
 
     while (true) {

@@ -36,6 +36,7 @@ Add to your build.zig:
 
 ```zig
 const std = @import("std");
+// Step 1: at the top of you're build add the build support functions
 const zdb = @import("zdb");
 
 pub fn build(b: *std.Build) void {
@@ -49,14 +50,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Step 1: Add ZDB module to your executable
+    // Step 2: Add ZDB module to your executable
     const zdb_dep = b.dependency("zdb", .{
         .target = target,
         .optimize = optimize,
     });
     exe.root_module.addImport("zdb", zdb_dep.module("zdb"));
     
-    // Step 2: Add debug command
+    // Step 3: Add debug command from that support
     zdb.addTo(b, exe, .{});
 
     b.installArtifact(exe);

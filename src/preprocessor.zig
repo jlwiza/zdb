@@ -1,35 +1,63 @@
 const std = @import("std");
-const Io = std.Io;
-const Permissions = std.Io.File.Permissions;
+const Ast = std.zig.Ast;
+const Node = Ast.Node;
 
-// Structure to hold different types of globals
+// ============================================================================
+// Types
+// ============================================================================
+
+const Edit = struct {
+    offset: usize,
+    delete_len: usize,
+    insert: []const u8,
+};
+
+const VarType = enum { regular, thread_local, comptime_const, pub_var, pub_const };
+
 const GlobalVar = struct {
     name: []const u8,
-    var_type: enum {
-        regular,
-        thread_local,
-        comptime_const,
-        pub_var,
-        pub_const,
-    },
+    var_type: VarType,
 };
+
+const ScopeVar = struct {
+    name: []const u8,
+};
+
+const WalkContext = struct {
+    ast: *const Ast,
+    source: []const u8,
+    edits: *std.ArrayList(Edit),
+    globals: *std.ArrayList(GlobalVar),
+    vars: *std.ArrayList(ScopeVar),
+    allocator: std.mem.Allocator,
+    fn_name: []const u8,
+    enable_step: bool,
+    needs_debug: bool,
+    // Track discard deletions per function — only commit if we actually inject code
+    pending_discards: std.ArrayList(Edit) = .empty,
+    injected_in_fn: bool = false,
+};
+
+// ============================================================================
+// Entry point
+// ============================================================================
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+
     var threaded: std.Io.Threaded = .init(allocator, .{
         .environ = init.environ,
         .argv0 = .init(init.args),
     });
-
     defer threaded.deinit();
     const io = threaded.ioBasic();
     const args = try init.args.toSlice(allocator);
 
     if (args.len < 3) {
         std.debug.print("Usage: preprocessor input.zig output.zig [--step] [--runtime-path <path>]\n", .{});
-        return 2; // common "bad args" exit code
+        return 2;
     }
 
     const input_file = args[1];
@@ -37,7 +65,6 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var enable_step = false;
     var runtime_path: ?[]const u8 = null;
 
-    // Parse additional arguments
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--step")) {
@@ -59,547 +86,854 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
 
     const source = try std.Io.Dir.cwd().readFileAlloc(io, input_file, allocator, .limited(10 * 1024 * 1024));
-    // const source = try std.fs.cwd().readFileAlloc(allocator, input_file, 10 * 1024 * 1024);
     defer allocator.free(source);
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
+    const is_build_file = std.mem.endsWith(u8, input_file, "build.zig");
 
-    // Check if file needs preprocessing
     const has_breakpoints = std.mem.indexOf(u8, source, "_ = .breakpoint;") != null;
     const has_step = std.mem.indexOf(u8, source, "step_debug()") != null;
     const needs_debug = has_breakpoints or has_step or enable_step;
 
-    if (needs_debug) {
-        // First, scan for module doc comments
-        var lines_iter = std.mem.splitScalar(u8, source, '\n');
-        var doc_comment_lines: std.ArrayList([]const u8) = .empty;
-        defer doc_comment_lines.deinit(allocator);
-
-        // Collect all module doc comments at the start
-        while (lines_iter.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (std.mem.startsWith(u8, trimmed, "//!")) {
-                try doc_comment_lines.append(allocator, line);
-            } else if (trimmed.len > 0) {
-                // Hit first non-doc-comment, non-empty line
-                break;
-            } else if (trimmed.len == 0) {
-                // Empty line - could be part of doc comment block
-                try doc_comment_lines.append(allocator, line);
-            }
-        }
-
-        // Add the auto-generated header
-        try output.appendSlice(allocator, "// AUTO-GENERATED - DO NOT EDIT\n");
-
-        // Re-add doc comments if any
-        for (doc_comment_lines.items) |doc_line| {
-            try output.appendSlice(allocator, doc_line);
-            try output.append(allocator, '\n');
-        }
-
-        // Add imports after doc comments
-        const has_std_import = std.mem.indexOf(u8, source, "@import(\"std\")") != null;
-        if (!has_std_import) {
-            try output.appendSlice(allocator, "const std = @import(\"std\");\n");
-        }
-
-        // Determine the import path for zdb runtime
-        if (runtime_path) |path| {
-            // Explicit runtime path provided
-            try output.print(allocator, "const zdb = @import(\"{s}\");\n\n", .{path});
-        } else if (std.mem.endsWith(u8, input_file, "build.zig")) {
-            // For build.zig - use a special marker that we'll handle differently
-            try output.appendSlice(allocator, "const zdb = @import(\"zdb\"); // SPECIAL:BUILD_FILE\n\n");
-        } else {
-            // Default for regular files - use module import
-            try output.appendSlice(allocator, "const zdb = @import(\"zdb\");\n\n");
-        }
-
-        // Reset lines iterator to process the rest
-        lines_iter.reset();
-
-        // Skip past the doc comments we already processed
-        var skip_count: usize = 0;
-        while (lines_iter.next()) |line| {
-            skip_count += 1;
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (std.mem.startsWith(u8, trimmed, "//!") or trimmed.len == 0) {
-                continue;
-            } else {
-                // Found first real line, back up one
-                skip_count -= 1;
-                break;
-            }
-        }
-
-        // Now process the rest of the file
-        lines_iter.reset();
-        var skipped: usize = 0;
-        while (lines_iter.next()) |_| : (skipped += 1) {
-            if (skipped >= skip_count) break;
-        }
-    }
-
-    // Process the source line by line
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    var vars_in_scope: std.ArrayList([]const u8) = .empty;
-    defer vars_in_scope.deinit(allocator);
-
-    // Track globals
-    var globals_in_file: std.ArrayList(GlobalVar) = .empty;
-    defer globals_in_file.deinit(allocator);
-
-    var in_function = false;
-    var current_function: []const u8 = "";
-    var indent_level: usize = 0;
-    var brace_count: usize = 0;
-    var line_number: usize = 0;
-    var step_mode_active = enable_step or has_step;
-    var in_initializer = false;
-    var global_brace_count: usize = 0; // Track top-level braces
-    var processed_header = false;
-
-    const is_build_file = std.mem.endsWith(u8, input_file, "build.zig");
-
-    while (lines.next()) |line| {
-        line_number += 1;
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-
-        // Skip doc comments and empty lines at the start if we've already processed them
-        if (needs_debug and !processed_header) {
-            if (std.mem.startsWith(u8, trimmed, "//!") or (trimmed.len == 0 and line_number <= 10)) {
-                continue;
-            } else {
-                processed_header = true;
-            }
-        }
-
-        // Track global brace count
-        for (trimmed) |c| {
-            if (c == '{') global_brace_count += 1;
-            if (c == '}' and global_brace_count > 0) global_brace_count -= 1;
-        }
-
-        // Track globals (only at top level)
-        if (!in_function and global_brace_count == 0) {
-            // Thread-local variables
-            if (std.mem.startsWith(u8, trimmed, "threadlocal var ")) {
-                if (parseVarNameFrom(trimmed, "threadlocal var ")) |var_name| {
-                    try globals_in_file.append(allocator, .{
-                        .name = try allocator.dupe(u8, var_name),
-                        .var_type = .thread_local,
-                    });
-                }
-            }
-            // Regular globals
-            else if (std.mem.startsWith(u8, trimmed, "var ")) {
-                if (parseVarName(trimmed)) |var_name| {
-                    try globals_in_file.append(allocator, .{
-                        .name = try allocator.dupe(u8, var_name),
-                        .var_type = .regular,
-                    });
-                }
-            }
-            // Public variables
-            else if (std.mem.startsWith(u8, trimmed, "pub var ")) {
-                if (parseVarNameFrom(trimmed, "pub var ")) |var_name| {
-                    try globals_in_file.append(allocator, .{
-                        .name = try allocator.dupe(u8, var_name),
-                        .var_type = .pub_var,
-                    });
-                }
-            }
-            // Constants (including comptime)
-            else if (std.mem.startsWith(u8, trimmed, "const ")) {
-                if (parseVarName(trimmed)) |var_name| {
-                    // Check if it's a comptime block
-                    const is_comptime = std.mem.indexOf(u8, trimmed, "comptime") != null;
-                    try globals_in_file.append(allocator, .{
-                        .name = try allocator.dupe(u8, var_name),
-                        .var_type = if (is_comptime) .comptime_const else .regular,
-                    });
-                }
-            }
-            // Public constants
-            else if (std.mem.startsWith(u8, trimmed, "pub const ")) {
-                if (parseVarNameFrom(trimmed, "pub const ")) |var_name| {
-                    try globals_in_file.append(allocator, .{
-                        .name = try allocator.dupe(u8, var_name),
-                        .var_type = .pub_const,
-                    });
-                }
-            }
-        }
-
-        // Special handling for build.zig files - rewrite paths
+    if (!needs_debug) {
         if (is_build_file) {
-            var modified_line = false;
-            var line_copy = try allocator.dupe(u8, line);
-            defer allocator.free(line_copy);
-
-            // Handle b.path() calls - prepend "../" to relative paths
-            if (std.mem.indexOf(u8, line_copy, "b.path(\"")) |path_start| {
-                var pos = path_start;
-                while (std.mem.indexOf(u8, line_copy[pos..], "b.path(\"")) |next_path| {
-                    pos = pos + next_path;
-                    const after_path = line_copy[pos + 8 ..];
-                    if (std.mem.indexOf(u8, after_path, "\"")) |quote_end| {
-                        const path = after_path[0..quote_end];
-                        // If it's a relative path (not absolute), prepend ../
-                        if (!std.mem.startsWith(u8, path, "/") and !std.mem.startsWith(u8, path, "../")) {
-                            var new_line: std.ArrayList(u8) = .empty;
-                            defer new_line.deinit(allocator);
-                            try new_line.appendSlice(allocator, line_copy[0 .. pos + 8]);
-                            try new_line.appendSlice(allocator, "../");
-                            try new_line.appendSlice(allocator, line_copy[pos + 8 ..]);
-                            allocator.free(line_copy);
-                            line_copy = try new_line.toOwnedSlice(allocator);
-                            modified_line = true;
-                            pos = pos + 8 + 3 + quote_end + 1; // Skip past this occurrence
-                        } else {
-                            pos = pos + 8 + quote_end + 1;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            if (modified_line) {
-                try output.appendSlice(allocator, line_copy);
-                try output.append(allocator, '\n');
-                continue;
-            }
+            var output_buf: std.ArrayList(u8) = .empty;
+            defer output_buf.deinit(allocator);
+            try rewriteBuildFile(source, &output_buf, allocator);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_file, .data = output_buf.items });
+        } else {
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_file, .data = source });
         }
-
-        // Handle imports - rewrite local imports to processed versions
-        if (std.mem.indexOf(u8, trimmed, "@import")) |import_start| {
-            const after_import = trimmed[import_start + 8 ..];
-            if (std.mem.indexOf(u8, after_import, "\"")) |quote_start| {
-                const path_start = quote_start + 1;
-                if (std.mem.indexOf(u8, after_import[path_start..], "\"")) |path_end| {
-                    const import_path = after_import[path_start .. path_start + path_end];
-
-                    // Special handling for build.zig files
-                    if (is_build_file and std.mem.endsWith(u8, import_path, ".zig")) {
-                        // Don't rewrite imports in build.zig - they should reference the original files
-                        try output.appendSlice(allocator, line);
-                        try output.append(allocator, '\n');
-                        continue;
-                    }
-
-                    if (std.mem.endsWith(u8, import_path, ".zig") and
-                        !std.mem.startsWith(u8, import_path, "std") and
-                        !std.mem.eql(u8, import_path, "debug_runtime.zig"))
-                    {
-                        try output.appendSlice(allocator, line[0 .. import_start + 8 + quote_start + 1]);
-                        try output.appendSlice(allocator, import_path);
-                        try output.appendSlice(allocator, after_import[path_start + path_end ..]);
-                        try output.append(allocator, '\n');
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Track when we enter any function
-        if (std.mem.indexOf(u8, trimmed, "fn ")) |fn_pos| {
-            if (fn_pos == 0 or trimmed[fn_pos - 1] == ' ') {
-                if (parseFunctionName(trimmed)) |fn_name| {
-                    in_function = true;
-                    current_function = try allocator.dupe(u8, fn_name);
-                    brace_count = 0;
-                    vars_in_scope.clearRetainingCapacity();
-                }
-            }
-        }
-
-        // Track braces to know when we exit a function
-        if (in_function) {
-            for (trimmed) |c| {
-                if (c == '{') brace_count += 1;
-                if (c == '}') {
-                    if (brace_count > 0) brace_count -= 1;
-                    if (brace_count == 0) {
-                        in_function = false;
-                        vars_in_scope.clearRetainingCapacity();
-                    }
-                }
-            }
-        }
-
-        // Track indent level
-        if (in_function) {
-            var spaces: usize = 0;
-            for (line) |c| {
-                if (c == ' ') spaces += 1 else break;
-            }
-            indent_level = spaces / 4;
-        }
-
-        // Handle step_debug() to enable step mode
-        if (std.mem.indexOf(u8, trimmed, "step_debug();")) |_| {
-            step_mode_active = true;
-            continue;
-        }
-
-        // Handle _ = .breakpoint; syntax
-        if (std.mem.indexOf(u8, trimmed, "_ = .breakpoint;")) |_| {
-            if (needs_debug) {
-                try injectBreakpoint(allocator, &output, current_function, &vars_in_scope, &globals_in_file, indent_level);
-            } else {
-                // In non-debug mode, replace with a comment
-                try output.appendSlice(allocator, line[0 .. line.len - trimmed.len]); // preserve indentation
-                try output.appendSlice(allocator, "// _ = .breakpoint; - disabled in non-debug mode\n");
-            }
-            continue;
-        }
-
-        // Track if we're in a multi-line initializer
-        if (std.mem.endsWith(u8, trimmed, "= {") or
-            std.mem.endsWith(u8, trimmed, "= .{") or
-            std.mem.endsWith(u8, trimmed, "= struct {") or
-            std.mem.indexOf(u8, trimmed, "struct {") != null or
-            (std.mem.endsWith(u8, trimmed, "{") and std.mem.indexOf(u8, trimmed, "]") != null))
-        {
-            in_initializer = true;
-        }
-        if (in_initializer and (std.mem.indexOf(u8, trimmed, "};") != null or std.mem.indexOf(u8, trimmed, "},") != null)) {
-            in_initializer = false;
-        }
-
-        // Inject step debugging
-        if (needs_debug and in_function and !in_initializer and shouldInjectStep(trimmed)) {
-            try injectStepDebugBefore(allocator, &output, current_function, trimmed, line_number, &vars_in_scope, &globals_in_file, indent_level);
-        }
-
-        // Check if this is a discard of a tracked variable
-        var is_tracked_discard = false;
-        if (std.mem.startsWith(u8, trimmed, "_ = ")) {
-            const discarded_var = std.mem.trim(u8, trimmed[4..], " ;");
-
-            // Check if this variable is being tracked locally
-            for (vars_in_scope.items) |v| {
-                if (std.mem.eql(u8, v, discarded_var)) {
-                    is_tracked_discard = true;
-                    break;
-                }
-            }
-            // Also check globals
-            if (!is_tracked_discard) {
-                for (globals_in_file.items) |g| {
-                    if (std.mem.eql(u8, g.name, discarded_var)) {
-                        is_tracked_discard = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Copy the original line UNLESS it's a discard of a tracked variable
-        if (!is_tracked_discard) {
-            try output.appendSlice(allocator, line);
-            try output.append(allocator, '\n');
-        }
-
-        // Track variables AFTER the line is output
-        if (in_function and brace_count == 1 and (std.mem.startsWith(u8, trimmed, "var ") or std.mem.startsWith(u8, trimmed, "const "))) {
-            if (parseVarName(trimmed)) |var_name| {
-                try vars_in_scope.append(allocator, try allocator.dupe(u8, var_name));
-            }
-        }
+        std.debug.print("Preprocessed {s} -> {s} (no debug needed)\n", .{ input_file, output_file });
+        return 0;
     }
 
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = output_file,
-        .data = output.items,
-    });
+    // Parse AST
+    const source_z = try allocator.dupeZ(u8, source);
+    var ast = try Ast.parse(allocator, source_z, .zig);
+    defer ast.deinit(allocator);
 
-    if (enable_step) {
-        std.debug.print("Preprocessed {s} -> {s} (step mode enabled, {} globals found)\n", .{ input_file, output_file, globals_in_file.items.len });
-    } else {
-        std.debug.print("Preprocessed {s} -> {s} ({} globals found)\n", .{ input_file, output_file, globals_in_file.items.len });
+    if (ast.errors.len > 0) {
+        // Parse errors — pass through unchanged
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_file, .data = source });
+        std.debug.print("Preprocessed {s} -> {s} (parse errors, passed through)\n", .{ input_file, output_file });
+        return 0;
     }
+
+    // ---- Collect edits ----
+    var edits: std.ArrayList(Edit) = .empty;
+    defer edits.deinit(allocator);
+
+    var globals: std.ArrayList(GlobalVar) = .empty;
+    defer globals.deinit(allocator);
+
+    var vars: std.ArrayList(ScopeVar) = .empty;
+    defer vars.deinit(allocator);
+
+    // Phase 1: Scan globals
+    scanGlobals(&ast, source, &globals, allocator);
+
+    // Phase 2: Add header
+    try addHeader(source, &edits, allocator, runtime_path, is_build_file);
+
+    // Phase 3: Walk functions
+    var ctx = WalkContext{
+        .ast = &ast,
+        .source = source,
+        .edits = &edits,
+        .globals = &globals,
+        .vars = &vars,
+        .allocator = allocator,
+        .fn_name = "",
+        .enable_step = enable_step or has_step,
+        .needs_debug = needs_debug,
+    };
+
+    try walkTopLevel(&ctx);
+
+    // Phase 4: Apply edits
+    var output_buf: std.ArrayList(u8) = .empty;
+    defer output_buf.deinit(allocator);
+    try applyEdits(source, edits.items, &output_buf, allocator);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_file, .data = output_buf.items });
+    std.debug.print("Preprocessed {s} -> {s} ({} edits, {} globals)\n", .{ input_file, output_file, edits.items.len, globals.items.len });
     return 0;
 }
 
-fn shouldInjectStep(line: []const u8) bool {
-    if (line.len == 0) return false;
-    if (std.mem.startsWith(u8, line, "}")) return false;
-    if (std.mem.eql(u8, line, "{")) return false;
-    if (std.mem.startsWith(u8, line, "//")) return false;
-    if (std.mem.eql(u8, line, "else")) return false;
-    if (std.mem.startsWith(u8, line, "return")) return false;
-    if (std.mem.indexOf(u8, line, "fn ") != null) return false;
-    if (std.mem.startsWith(u8, line, ".{")) return false;
-    if (std.mem.startsWith(u8, line, ".[")) return false;
-    if (std.mem.startsWith(u8, line, ".")) return false;
-    if (std.mem.endsWith(u8, line, ",")) return false;
-    return true;
+// ============================================================================
+// AST Walking
+// ============================================================================
+
+fn walkTopLevel(ctx: *WalkContext) WalkError!void {
+    for (ctx.ast.rootDecls()) |decl_idx| {
+        try walkDecl(ctx, decl_idx);
+    }
 }
 
-fn injectBreakpoint(
-    allocator: std.mem.Allocator,
-    output: *std.ArrayList(u8),
-    function_name: []const u8,
-    vars_in_scope: *std.ArrayList([]const u8),
-    globals: *std.ArrayList(GlobalVar),
-    indent_level: usize,
-) !void {
-    const indent = "    " ** 16;
-    const actual_indent = indent[0..(indent_level * 4)];
+/// Process a declaration: fn → walk body, container → recurse members, var → check init
+fn walkDecl(ctx: *WalkContext, node: Node.Index) WalkError!void {
+    const tag = ctx.ast.nodeTag(node);
 
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "{\n");
+    switch (tag) {
+        .fn_decl => try walkFunction(ctx, node),
 
-    // Build variable names - just the names, no annotations
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "    const var_names = [_][]const u8{");
+        // Container types — recurse to find nested functions
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => {
+            var buf: [2]Node.Index = undefined;
+            if (ctx.ast.fullContainerDecl(&buf, node)) |full| {
+                for (full.ast.members) |member| {
+                    try walkDecl(ctx, member);
+                }
+            }
+        },
 
-    // Local variables
-    for (vars_in_scope.items, 0..) |v, i| {
-        if (i > 0) try output.appendSlice(allocator, ", ");
-        try output.print(allocator, "\"{s}\"", .{v});
+        // Variable decls whose init might be a container
+        .simple_var_decl,
+        .local_var_decl,
+        .global_var_decl,
+        .aligned_var_decl,
+        => {
+            if (ctx.ast.fullVarDecl(node)) |decl| {
+                if (decl.ast.init_node.unwrap()) |init_node| {
+                    try walkDecl(ctx, init_node);
+                }
+            }
+        },
+
+        else => {},
     }
-
-    // Global variables - just names
-    if (vars_in_scope.items.len > 0 and globals.items.len > 0) {
-        try output.appendSlice(allocator, ", ");
-    }
-    for (globals.items, 0..) |g, i| {
-        if (i > 0) try output.appendSlice(allocator, ", ");
-        try output.print(allocator, "\"{s}\"", .{g.name});
-    }
-    try output.appendSlice(allocator, "};\n");
-
-    // Build variable values
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "    const var_values = .{");
-
-    // Local values
-    for (vars_in_scope.items, 0..) |v, i| {
-        if (i > 0) try output.appendSlice(allocator, ", ");
-        try output.appendSlice(allocator, v);
-    }
-
-    // Global values
-    if (vars_in_scope.items.len > 0 and globals.items.len > 0) {
-        try output.appendSlice(allocator, ", ");
-    }
-    for (globals.items, 0..) |g, i| {
-        if (i > 0) try output.appendSlice(allocator, ", ");
-        try output.appendSlice(allocator, g.name);
-    }
-    try output.appendSlice(allocator, "};\n");
-
-    try output.appendSlice(allocator, actual_indent);
-    try output.print(allocator, "    zdb.handleBreakpoint(\"{s}\", &var_names, var_values);\n", .{function_name});
-
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "}\n");
 }
 
-fn injectStepDebugBefore(
-    allocator: std.mem.Allocator,
-    output: *std.ArrayList(u8),
-    function_name: []const u8,
-    next_line: []const u8,
-    line_number: usize,
-    vars_in_scope: *std.ArrayList([]const u8),
-    globals: *std.ArrayList(GlobalVar),
-    indent_level: usize,
-) !void {
-    const indent = "    " ** 16;
-    const actual_indent = indent[0..(indent_level * 4)];
+/// Walk a function: extract name, walk body block
+fn walkFunction(ctx: *WalkContext, fn_node: Node.Index) WalkError!void {
+    // fn_decl data is node_and_node: [0]=proto, [1]=body
+    const data = ctx.ast.nodeData(fn_node).node_and_node;
+    const proto_node = data[0];
+    const body_node = data[1];
 
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "{\n");
+    // Get function name
+    var proto_buf: [1]Node.Index = undefined;
+    const fn_name = if (ctx.ast.fullFnProto(&proto_buf, proto_node)) |proto|
+        if (proto.name_token) |nt| ctx.ast.tokenSlice(nt) else "unknown"
+    else
+        "unknown";
 
-    // Build variable info - just names
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "    const var_names = [_][]const u8{");
+    const saved_fn = ctx.fn_name;
+    const saved_vars_len = ctx.vars.items.len;
+    ctx.fn_name = fn_name;
 
-    for (vars_in_scope.items, 0..) |v, i| {
-        if (i > 0) try output.appendSlice(allocator, ", ");
-        try output.print(allocator, "\"{s}\"", .{v});
+    // Track pending discards and injection flag for this function
+    const saved_injected = ctx.injected_in_fn;
+    const discards_before = ctx.pending_discards.items.len;
+    ctx.injected_in_fn = false;
+
+    // Add function parameters as scope variables
+    if (ctx.ast.fullFnProto(&proto_buf, proto_node)) |proto| {
+        var it = proto.iterate(ctx.ast);
+        while (it.next()) |param| {
+            if (param.name_token) |name_tok| {
+                try ctx.vars.append(ctx.allocator, .{
+                    .name = try ctx.allocator.dupe(u8, ctx.ast.tokenSlice(name_tok)),
+                });
+            }
+        }
     }
 
-    if (vars_in_scope.items.len > 0 and globals.items.len > 0) {
-        try output.appendSlice(allocator, ", ");
+    try walkBlock(ctx, body_node);
+
+    // If instrumentation was injected in THIS function, commit the discard deletions
+    if (ctx.injected_in_fn) {
+        for (ctx.pending_discards.items[discards_before..]) |discard_edit| {
+            try ctx.edits.append(ctx.allocator, discard_edit);
+        }
+    }
+    // Either way, clear pending discards for this function
+    ctx.pending_discards.shrinkRetainingCapacity(discards_before);
+
+    ctx.injected_in_fn = saved_injected;
+    ctx.fn_name = saved_fn;
+    ctx.vars.shrinkRetainingCapacity(saved_vars_len);
+}
+
+const WalkError = error{OutOfMemory};
+
+/// Walk a block's statements
+fn walkBlock(ctx: *WalkContext, block_node: Node.Index) WalkError!void {
+    const scope_save = ctx.vars.items.len;
+
+    var stmts_buf: [2]Node.Index = undefined;
+    const stmts = ctx.ast.blockStatements(&stmts_buf, block_node) orelse return;
+
+    for (stmts) |stmt| {
+        const tag = ctx.ast.nodeTag(stmt);
+        const main_tok = ctx.ast.nodeMainToken(stmt);
+        const stmt_start: usize = ctx.ast.tokenStart(main_tok);
+
+        const line_text = getLineAt(ctx.source, stmt_start);
+        const trimmed = std.mem.trim(u8, line_text, " \t\r");
+        const line_number = getLineNumber(ctx.source, stmt_start);
+
+        // ---- Breakpoint: `_ = .breakpoint;` ----
+        if (isBreakpoint(trimmed)) {
+            const ls = lineStartOffset(ctx.source, stmt_start);
+            const le = lineEndOffset(ctx.source, stmt_start);
+            const indent = getIndent(ctx.source, stmt_start);
+            try ctx.edits.append(ctx.allocator, .{
+                .offset = ls,
+                .delete_len = le - ls,
+                .insert = try genBreakpoint(ctx, indent),
+            });
+            ctx.injected_in_fn = true;
+            continue;
+        }
+
+        // ---- step_debug() marker ----
+        if (std.mem.indexOf(u8, trimmed, "step_debug();") != null) {
+            continue;
+        }
+
+        // ---- Discard of tracked variable: queue for deletion ----
+        // Only actually deleted if instrumentation is injected in this function
+        if (isTrackedDiscard(trimmed, ctx.vars.items, ctx.globals.items)) {
+            const ls = lineStartOffset(ctx.source, stmt_start);
+            const le = lineEndOffset(ctx.source, stmt_start);
+            try ctx.pending_discards.append(ctx.allocator, .{
+                .offset = ls,
+                .delete_len = le - ls,
+                .insert = "",
+            });
+        }
+
+        // ---- Inject step debug ----
+        if (ctx.needs_debug and ctx.enable_step and isInjectableStatement(tag)) {
+            const insert_at = lineStartOffset(ctx.source, stmt_start);
+            const indent = getIndent(ctx.source, stmt_start);
+            try ctx.edits.append(ctx.allocator, .{
+                .offset = insert_at,
+                .delete_len = 0,
+                .insert = try genStepDebug(ctx, trimmed, line_number, indent),
+            });
+            ctx.injected_in_fn = true;
+        }
+
+        // ---- Track variable declarations ----
+        if (isVarDecl(tag)) {
+            if (getVarDeclName(ctx.ast, stmt)) |name| {
+                if (!isImportDecl(ctx.ast, ctx.source, stmt)) {
+                    try ctx.vars.append(ctx.allocator, .{
+                        .name = try ctx.allocator.dupe(u8, name),
+                    });
+                }
+            }
+        }
+
+        // ---- Recurse into sub-blocks ----
+        try walkSubBlocks(ctx, stmt);
     }
 
-    for (globals.items, 0..) |g, i| {
-        if (i > 0) try output.appendSlice(allocator, ", ");
-        try output.print(allocator, "\"{s}\"", .{g.name});
-    }
-    try output.appendSlice(allocator, "};\n");
+    ctx.vars.shrinkRetainingCapacity(scope_save);
+}
 
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "    const var_values = .{");
+/// Recursively find and walk blocks nested inside a node
+fn walkSubBlocks(ctx: *WalkContext, node: Node.Index) WalkError!void {
+    const tag = ctx.ast.nodeTag(node);
 
-    for (vars_in_scope.items, 0..) |v, i| {
-        if (i > 0) try output.appendSlice(allocator, ", ");
-        try output.appendSlice(allocator, v);
-    }
-
-    if (vars_in_scope.items.len > 0 and globals.items.len > 0) {
-        try output.appendSlice(allocator, ", ");
+    // If this node IS a block, walk it directly
+    if (isBlockLike(tag)) {
+        try walkBlock(ctx, node);
+        return;
     }
 
-    for (globals.items, 0..) |g, i| {
-        if (i > 0) try output.appendSlice(allocator, ", ");
-        try output.appendSlice(allocator, g.name);
+    switch (tag) {
+        // If/else
+        .@"if", .if_simple => {
+            if (ctx.ast.fullIf(node)) |full| {
+                try walkBlockOrRecurse(ctx, full.ast.then_expr);
+                if (full.ast.else_expr.unwrap()) |else_expr| {
+                    try walkBlockOrRecurse(ctx, else_expr);
+                }
+            }
+        },
+
+        // While loops
+        .@"while", .while_simple, .while_cont => {
+            if (ctx.ast.fullWhile(node)) |full| {
+                try walkBlockOrRecurse(ctx, full.ast.then_expr);
+                if (full.ast.else_expr.unwrap()) |else_expr| {
+                    try walkBlockOrRecurse(ctx, else_expr);
+                }
+            }
+        },
+
+        // For loops
+        .@"for", .for_simple => {
+            if (ctx.ast.fullFor(node)) |full| {
+                try walkBlockOrRecurse(ctx, full.ast.then_expr);
+                if (full.ast.else_expr.unwrap()) |else_expr| {
+                    try walkBlockOrRecurse(ctx, else_expr);
+                }
+            }
+        },
+
+        // Switch — walk each case body
+        .@"switch", .switch_comma => {
+            if (ctx.ast.fullSwitch(node)) |full| {
+                for (full.ast.cases) |case_node| {
+                    if (ctx.ast.fullSwitchCase(case_node)) |case| {
+                        try walkBlockOrRecurse(ctx, case.ast.target_expr);
+                    }
+                }
+            }
+        },
+
+        // Catch/orelse — RHS might be a block
+        .@"catch" => {
+            const rhs = ctx.ast.nodeData(node).node_and_node[1];
+            try walkBlockOrRecurse(ctx, rhs);
+        },
+        .@"orelse" => {
+            const rhs = ctx.ast.nodeData(node).node_and_node[1];
+            try walkBlockOrRecurse(ctx, rhs);
+        },
+
+        // fn_decl inside expressions (nested functions)
+        .fn_decl => try walkFunction(ctx, node),
+
+        // Generic: try to walk children based on data type
+        else => {
+            // For nodes with two child nodes, try walking both
+            walkChildNodes(ctx, node) catch {};
+        },
     }
-    try output.appendSlice(allocator, "};\n");
+}
 
-    // Call handleStepBefore
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "    zdb.handleStepBefore(\"");
-    try output.appendSlice(allocator, function_name);
-    try output.appendSlice(allocator, "\", \"");
+/// Walk a node as a block if it is one, otherwise recurse for nested blocks
+fn walkBlockOrRecurse(ctx: *WalkContext, node: Node.Index) WalkError!void {
+    if (isBlockLike(ctx.ast.nodeTag(node))) {
+        try walkBlock(ctx, node);
+    } else {
+        try walkSubBlocks(ctx, node);
+    }
+}
 
-    // Escape special characters
-    for (next_line) |c| {
+/// Try to walk child nodes generically (best-effort)
+fn walkChildNodes(ctx: *WalkContext, node: Node.Index) WalkError!void {
+    const tag = ctx.ast.nodeTag(node);
+    const data = ctx.ast.nodeData(node);
+
+    // Try common data shapes that have child nodes
+    switch (tag) {
+        // Nodes with node_and_node data
+        .@"catch",
+        .equal_equal,
+        .bang_equal,
+        .assign,
+        .assign_add,
+        .assign_sub,
+        .assign_mul,
+        .assign_div,
+        .assign_mod,
+        .assign_shl,
+        .assign_shr,
+        .assign_bit_and,
+        .assign_bit_or,
+        .assign_bit_xor,
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .mod,
+        .@"orelse",
+        .bool_and,
+        .bool_or,
+        .array_access,
+        .slice_open,
+        .error_union,
+        .array_type,
+        .switch_range,
+        .if_simple,
+        .while_simple,
+        .for_simple,
+        .fn_decl,
+        .array_init_one,
+        .array_init_one_comma,
+        => {
+            const children = data.node_and_node;
+            try walkSubBlocks(ctx, children[0]);
+            try walkSubBlocks(ctx, children[1]);
+        },
+
+        // Nodes with a single child
+        .@"return" => {
+            if (data.opt_node.unwrap()) |child| {
+                try walkSubBlocks(ctx, child);
+            }
+        },
+        .@"try",
+        .@"defer",
+        .@"comptime",
+        .@"nosuspend",
+        .bool_not,
+        .negation,
+        .bit_not,
+        .address_of,
+        .deref,
+        .@"suspend",
+        .@"resume",
+        => {
+            try walkSubBlocks(ctx, data.node);
+        },
+
+        else => {},
+    }
+}
+
+// ============================================================================
+// Globals scanning
+// ============================================================================
+
+fn scanGlobals(ast: *const Ast, source: []const u8, globals: *std.ArrayList(GlobalVar), allocator: std.mem.Allocator) void {
+    for (ast.rootDecls()) |decl_node| {
+        const tag = ast.nodeTag(decl_node);
+        if (!isVarDecl(tag)) continue;
+
+        const name = getVarDeclName(ast, decl_node) orelse continue;
+        if (isImportDecl(ast, source, decl_node)) continue;
+        if (isTypeAlias(ast, decl_node)) continue;
+
+        const main_tok = ast.nodeMainToken(decl_node);
+        const line = getLineAt(source, ast.tokenStart(main_tok));
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        var var_type: VarType = .regular;
+        if (std.mem.startsWith(u8, trimmed, "threadlocal ")) {
+            var_type = .thread_local;
+        } else if (std.mem.startsWith(u8, trimmed, "pub var ")) {
+            var_type = .pub_var;
+        } else if (std.mem.startsWith(u8, trimmed, "pub const ")) {
+            var_type = .pub_const;
+        } else if (std.mem.startsWith(u8, trimmed, "const ")) {
+            const is_comptime = std.mem.indexOf(u8, trimmed, "comptime") != null;
+            var_type = if (is_comptime) .comptime_const else .regular;
+        }
+
+        globals.append(allocator, .{
+            .name = allocator.dupe(u8, name) catch continue,
+            .var_type = var_type,
+        }) catch {};
+    }
+}
+
+// ============================================================================
+// Header injection
+// ============================================================================
+
+fn addHeader(source: []const u8, edits: *std.ArrayList(Edit), allocator: std.mem.Allocator, runtime_path: ?[]const u8, is_build_file: bool) !void {
+    var insert_offset: usize = 0;
+
+    // Skip BOM
+    if (source.len >= 3 and source[0] == 0xEF and source[1] == 0xBB and source[2] == 0xBF) {
+        insert_offset = 3;
+    }
+
+    // Skip module doc comments (//!) and blank lines at top
+    var pos: usize = insert_offset;
+    while (pos < source.len) {
+        while (pos < source.len and (source[pos] == ' ' or source[pos] == '\t' or source[pos] == '\r')) pos += 1;
+        if (pos < source.len and source[pos] == '\n') {
+            pos += 1;
+            insert_offset = pos;
+            continue;
+        }
+        if (pos + 3 <= source.len and std.mem.eql(u8, source[pos .. pos + 3], "//!")) {
+            while (pos < source.len and source[pos] != '\n') pos += 1;
+            if (pos < source.len) pos += 1;
+            insert_offset = pos;
+        } else {
+            break;
+        }
+    }
+
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(allocator);
+
+    try header.appendSlice(allocator, "// AUTO-GENERATED - DO NOT EDIT\n");
+
+    if (std.mem.indexOf(u8, source, "@import(\"std\")") == null) {
+        try header.appendSlice(allocator, "const std = @import(\"std\");\n");
+    }
+
+    if (std.mem.indexOf(u8, source, "@import(\"zdb\")") == null) {
+        if (runtime_path) |path| {
+            try header.print(allocator, "const zdb = @import(\"{s}\");\n", .{path});
+        } else if (is_build_file) {
+            try header.appendSlice(allocator, "const zdb = @import(\"zdb\"); // SPECIAL:BUILD_FILE\n");
+        } else {
+            try header.appendSlice(allocator, "const zdb = @import(\"zdb\");\n");
+        }
+    }
+
+    try header.appendSlice(allocator, "\n");
+
+    try edits.append(allocator, .{
+        .offset = insert_offset,
+        .delete_len = 0,
+        .insert = try allocator.dupe(u8, header.items),
+    });
+}
+
+// ============================================================================
+// Code generation
+// ============================================================================
+
+fn genBreakpoint(ctx: *WalkContext, indent: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "if (!@inComptime()) {\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "    const var_names = [_][]const u8{");
+    try appendVarNames(&buf, ctx);
+    try buf.appendSlice(ctx.allocator, "};\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "    const var_values = .{");
+    try appendVarValues(&buf, ctx);
+    try buf.appendSlice(ctx.allocator, "};\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.print(ctx.allocator, "    zdb.handleBreakpoint(\"{s}\", &var_names, var_values);\n", .{ctx.fn_name});
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "}\n");
+    return buf.toOwnedSlice(ctx.allocator);
+}
+
+fn genStepDebug(ctx: *WalkContext, line_text: []const u8, line_number: usize, indent: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "if (!@inComptime()) {\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "    const var_names = [_][]const u8{");
+    try appendVarNames(&buf, ctx);
+    try buf.appendSlice(ctx.allocator, "};\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "    const var_values = .{");
+    try appendVarValues(&buf, ctx);
+    try buf.appendSlice(ctx.allocator, "};\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "    zdb.handleStepBefore(\"");
+    try buf.appendSlice(ctx.allocator, ctx.fn_name);
+    try buf.appendSlice(ctx.allocator, "\", \"");
+    try appendEscaped(&buf, ctx.allocator, line_text);
+    try buf.print(ctx.allocator, "\", {}, &var_names, var_values);\n", .{line_number});
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "}\n");
+    return buf.toOwnedSlice(ctx.allocator);
+}
+
+fn appendVarNames(buf: *std.ArrayList(u8), ctx: *WalkContext) !void {
+    var first = true;
+    for (ctx.vars.items) |v| {
+        if (!first) try buf.appendSlice(ctx.allocator, ", ");
+        try buf.print(ctx.allocator, "\"{s}\"", .{v.name});
+        first = false;
+    }
+    for (ctx.globals.items) |g| {
+        if (!first) try buf.appendSlice(ctx.allocator, ", ");
+        try buf.print(ctx.allocator, "\"{s}\"", .{g.name});
+        first = false;
+    }
+}
+
+fn appendVarValues(buf: *std.ArrayList(u8), ctx: *WalkContext) !void {
+    var first = true;
+    for (ctx.vars.items) |v| {
+        if (!first) try buf.appendSlice(ctx.allocator, ", ");
+        try buf.appendSlice(ctx.allocator, v.name);
+        first = false;
+    }
+    for (ctx.globals.items) |g| {
+        if (!first) try buf.appendSlice(ctx.allocator, ", ");
+        try buf.appendSlice(ctx.allocator, g.name);
+        first = false;
+    }
+}
+
+fn appendEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text) |c| {
         switch (c) {
-            '"' => try output.appendSlice(allocator, "\\\""),
-            '\\' => try output.appendSlice(allocator, "\\\\"),
-            '\n' => try output.appendSlice(allocator, "\\n"),
-            '\r' => try output.appendSlice(allocator, "\\r"),
-            '\t' => try output.appendSlice(allocator, "\\t"),
-            else => try output.append(allocator, c),
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, c),
         }
     }
-
-    try output.print(allocator, "\", {}, &var_names, var_values);\n", .{line_number});
-
-    try output.appendSlice(allocator, actual_indent);
-    try output.appendSlice(allocator, "}\n");
 }
 
-fn parseVarName(line: []const u8) ?[]const u8 {
-    var tokens = std.mem.tokenizeAny(u8, line, " :=");
-    _ = tokens.next(); // skip var/const
-    return tokens.next();
+// ============================================================================
+// Edit application
+// ============================================================================
+
+fn applyEdits(source: []const u8, edits_slice: []const Edit, output: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    // Sort edits by offset ascending
+    const sorted = try allocator.dupe(Edit, edits_slice);
+    std.mem.sort(Edit, sorted, {}, struct {
+        fn f(_: void, a: Edit, b: Edit) bool {
+            return a.offset < b.offset;
+        }
+    }.f);
+
+    // Build output by walking through source and applying edits
+    var src_pos: usize = 0;
+    for (sorted) |edit| {
+        if (edit.offset > src_pos) {
+            try output.appendSlice(allocator, source[src_pos..edit.offset]);
+        }
+        if (edit.insert.len > 0) {
+            try output.appendSlice(allocator, edit.insert);
+        }
+        src_pos = edit.offset + edit.delete_len;
+    }
+    if (src_pos < source.len) {
+        try output.appendSlice(allocator, source[src_pos..]);
+    }
 }
 
-fn parseVarNameFrom(line: []const u8, prefix: []const u8) ?[]const u8 {
-    if (std.mem.startsWith(u8, line, prefix)) {
-        const after_prefix = line[prefix.len..];
-        var tokens = std.mem.tokenizeAny(u8, after_prefix, " :=");
-        return tokens.next();
+// ============================================================================
+// AST helpers
+// ============================================================================
+
+fn getVarDeclName(ast: *const Ast, node: Node.Index) ?[]const u8 {
+    if (ast.fullVarDecl(node)) |decl| {
+        // mut_token is the `const`/`var` keyword. Name is the next token.
+        const name_tok = decl.ast.mut_token + 1;
+        if (name_tok < ast.tokens.len) {
+            const name = ast.tokenSlice(name_tok);
+            if (name.len > 0 and (std.ascii.isAlphabetic(name[0]) or name[0] == '_')) {
+                return name;
+            }
+        }
     }
     return null;
 }
 
-fn parseFunctionName(line: []const u8) ?[]const u8 {
-    if (std.mem.indexOf(u8, line, "fn ")) |fn_pos| {
-        const after_fn = line[fn_pos + 3 ..];
-        if (std.mem.indexOf(u8, after_fn, "(")) |paren_pos| {
-            const name = std.mem.trim(u8, after_fn[0..paren_pos], " ");
-            return name;
+// ============================================================================
+// Classification helpers
+// ============================================================================
+
+fn isVarDecl(tag: Node.Tag) bool {
+    return tag == .simple_var_decl or tag == .local_var_decl or
+        tag == .global_var_decl or tag == .aligned_var_decl;
+}
+
+fn isBlockLike(tag: Node.Tag) bool {
+    return tag == .block or tag == .block_semicolon or
+        tag == .block_two or tag == .block_two_semicolon;
+}
+
+fn isInjectableStatement(tag: Node.Tag) bool {
+    return switch (tag) {
+        .simple_var_decl,
+        .local_var_decl,
+        .global_var_decl,
+        .aligned_var_decl,
+        .assign,
+        .assign_destructure,
+        .assign_add,
+        .assign_sub,
+        .assign_mul,
+        .assign_div,
+        .assign_mod,
+        .assign_shl,
+        .assign_shr,
+        .assign_bit_and,
+        .assign_bit_or,
+        .assign_bit_xor,
+        .assign_mul_wrap,
+        .assign_add_wrap,
+        .assign_sub_wrap,
+        .assign_mul_sat,
+        .assign_add_sat,
+        .assign_sub_sat,
+        .assign_shl_sat,
+        .call,
+        .call_comma,
+        .call_one,
+        .call_one_comma,
+        .builtin_call,
+        .builtin_call_comma,
+        .builtin_call_two,
+        .builtin_call_two_comma,
+        .@"return",
+        .@"if",
+        .if_simple,
+        .@"while",
+        .while_simple,
+        .while_cont,
+        .@"for",
+        .for_simple,
+        .@"switch",
+        .switch_comma,
+        .@"break",
+        .@"continue",
+        .field_access,
+        .@"try",
+        .@"defer",
+        .@"errdefer",
+        .unwrap_optional,
+        .deref,
+        .array_access,
+        .@"catch",
+        .@"orelse",
+        .grouped_expression,
+        .@"suspend",
+        .@"resume",
+        => true,
+        else => false,
+    };
+}
+
+fn isBreakpoint(trimmed: []const u8) bool {
+    return std.mem.eql(u8, trimmed, "_ = .breakpoint;");
+}
+
+fn isTrackedDiscard(trimmed: []const u8, vars: []const ScopeVar, globals: []const GlobalVar) bool {
+    if (!std.mem.startsWith(u8, trimmed, "_ = ")) return false;
+    const rest = trimmed[4..];
+    const semi = std.mem.indexOf(u8, rest, ";") orelse return false;
+    const name = std.mem.trim(u8, rest[0..semi], " ");
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    }
+    for (vars) |v| {
+        if (std.mem.eql(u8, v.name, name)) return true;
+    }
+    for (globals) |g| {
+        if (std.mem.eql(u8, g.name, name)) return true;
+    }
+    return false;
+}
+
+fn isImportDecl(ast: *const Ast, source: []const u8, node: Node.Index) bool {
+    if (ast.fullVarDecl(node)) |decl| {
+        if (decl.ast.init_node.unwrap()) |init_node| {
+            const init_tag = ast.nodeTag(init_node);
+            if (init_tag == .builtin_call_two or init_tag == .builtin_call_two_comma or
+                init_tag == .builtin_call or init_tag == .builtin_call_comma)
+            {
+                const init_main = ast.nodeMainToken(init_node);
+                const name = ast.tokenSlice(init_main);
+                if (std.mem.eql(u8, name, "@import")) return true;
+            }
         }
     }
-    return null;
+    // Fallback
+    const main_tok = ast.nodeMainToken(node);
+    const line = getLineAt(source, ast.tokenStart(main_tok));
+    return std.mem.indexOf(u8, line, "@import(") != null;
+}
+
+fn isTypeAlias(ast: *const Ast, node: Node.Index) bool {
+    if (ast.fullVarDecl(node)) |decl| {
+        if (decl.ast.init_node.unwrap()) |init_node| {
+            const init_tag = ast.nodeTag(init_node);
+            if (init_tag == .field_access) return true;
+            // Container decl = inline struct/enum/union definition
+            switch (init_tag) {
+                .container_decl,
+                .container_decl_two,
+                .container_decl_trailing,
+                .container_decl_two_trailing,
+                .container_decl_arg,
+                .container_decl_arg_trailing,
+                .tagged_union,
+                .tagged_union_two,
+                .tagged_union_trailing,
+                .tagged_union_two_trailing,
+                .tagged_union_enum_tag,
+                .tagged_union_enum_tag_trailing,
+                => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Source position utilities
+// ============================================================================
+
+fn lineStartOffset(source: []const u8, offset: usize) usize {
+    var pos = offset;
+    while (pos > 0 and source[pos - 1] != '\n') pos -= 1;
+    return pos;
+}
+
+fn lineEndOffset(source: []const u8, offset: usize) usize {
+    var pos = offset;
+    while (pos < source.len and source[pos] != '\n') pos += 1;
+    if (pos < source.len) pos += 1;
+    return pos;
+}
+
+fn getLineAt(source: []const u8, offset: usize) []const u8 {
+    const start = lineStartOffset(source, offset);
+    var end = offset;
+    while (end < source.len and source[end] != '\n') end += 1;
+    return source[start..end];
+}
+
+fn getLineNumber(source: []const u8, offset: usize) usize {
+    var line: usize = 1;
+    for (source[0..@min(offset, source.len)]) |c| {
+        if (c == '\n') line += 1;
+    }
+    return line;
+}
+
+fn getIndent(source: []const u8, offset: usize) []const u8 {
+    const start = lineStartOffset(source, offset);
+    var end = start;
+    while (end < source.len and (source[end] == ' ' or source[end] == '\t')) end += 1;
+    return source[start..end];
+}
+
+// ============================================================================
+// Build file rewriting
+// ============================================================================
+
+fn rewriteBuildFile(source: []const u8, output: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    var pos: usize = 0;
+    while (pos < source.len) {
+        if (std.mem.indexOf(u8, source[pos..], "b.path(\"")) |rel_start| {
+            const abs_start = pos + rel_start;
+            try output.appendSlice(allocator, source[pos .. abs_start + 8]);
+            const after = source[abs_start + 8 ..];
+            if (std.mem.indexOf(u8, after, "\"")) |quote_end| {
+                const path = after[0..quote_end];
+                if (!std.mem.startsWith(u8, path, "/") and !std.mem.startsWith(u8, path, "../")) {
+                    try output.appendSlice(allocator, "../");
+                }
+                try output.appendSlice(allocator, path);
+                pos = abs_start + 8 + quote_end;
+            } else {
+                pos = abs_start + 8;
+            }
+        } else {
+            try output.appendSlice(allocator, source[pos..]);
+            break;
+        }
+    }
 }

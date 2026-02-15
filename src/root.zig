@@ -28,7 +28,6 @@ pub fn addTo(
 ) void {
     const target = exe.root_module.resolved_target.?;
     const optimize = exe.root_module.optimize.?;
-
     // Get ourselves as a dependency
     const zdb_dep = b.dependency("zdb", .{
         .target = target,
@@ -111,7 +110,6 @@ pub fn addTo(
         preprocess_main.addArg("--step");
     }
     preprocess_main.step.dependOn(&make_dir.step);
-
     // Build debug exe
     const exe_debug = b.addExecutable(.{
         .name = b.fmt("{s}-debug", .{exe.name}),
@@ -122,42 +120,83 @@ pub fn addTo(
         }),
     });
 
+    // set up the main dir were gonna loop through all the other zig files
+    const src_dir = std.Io.Dir.path.dirname(main_path) orelse "src";
+
+    const src_dir_handle = std.Io.Dir.cwd().openDir(io, src_dir, .{ .iterate = true }) catch |err| {
+        std.debug.print("Error: Failed to open source directory '{s}': {}\n", .{ src_dir, err });
+        std.debug.print("Cannot process additional .zig files for debugging.\n", .{});
+        @panic("Build failed: unable to access source directory");
+    };
+    defer src_dir_handle.close(io);
+
+    var walker = src_dir_handle.walk(b.allocator) catch |err| {
+        std.debug.print("Error: Failed to create directory walker: {}\n", .{err});
+        @panic("Build failed: unable to walk source directory");
+    };
+    defer walker.deinit();
+
+    const src_dir_name = std.Io.Dir.path.basename(src_dir);
+
+    while (walker.next(io) catch |err| {
+        std.debug.print("Error: Failed to read directory entry: {}\n", .{err});
+        @panic("Build failed: error walking source directory");
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+
+        const full_entry_path = std.Io.Dir.path.join(b.allocator, &.{ src_dir, entry.path }) catch |err| {
+            std.debug.print("Error: Failed to join path: {}\n", .{err});
+            @panic("Build failed: path construction error");
+        };
+        defer b.allocator.free(full_entry_path);
+        // skip the main file
+        if (std.mem.eql(u8, full_entry_path, main_path)) continue;
+
+        const input_path = std.Io.Dir.path.join(b.allocator, &.{ src_dir, entry.path }) catch |err| {
+            std.debug.print("Error: Failed to construct input path for '{s}': {}\n", .{ entry.path, err });
+            @panic("Build failed: path construction error");
+        };
+        defer b.allocator.free(input_path);
+
+        const output_rel_path = std.Io.Dir.path.join(b.allocator, &.{ src_dir_name, entry.path }) catch |err| {
+            std.debug.print("Error: Failed to construct relative output path for '{s}': {}\n", .{ entry.path, err });
+            @panic("Build failed: path construction error");
+        };
+        defer b.allocator.free(output_rel_path);
+
+        const output_path = std.Io.Dir.path.join(b.allocator, &.{ options.processed_dir, output_rel_path }) catch |err| {
+            std.debug.print("Error: Failed to construct output path for '{s}': {}\n", .{ entry.path, err });
+            @panic("Build failed: path construction error");
+        };
+        defer b.allocator.free(output_path);
+
+        // Create directory for the path if needed
+        if (std.Io.Dir.path.dirname(output_path)) |dir| {
+            const make_subdir = b.addSystemCommand(&.{ "mkdir", "-p", dir });
+            preprocess_main.step.dependOn(&make_subdir.step);
+        }
+
+        // Preprocess this file
+        const preprocess_file = b.addRunArtifact(preprocessor);
+        preprocess_file.addArg(input_path);
+        preprocess_file.addArg(output_path);
+        if (options.enable_step_mode) {
+            preprocess_file.addArg("--step");
+        }
+        exe_debug.step.dependOn(&preprocess_file.step);
+    }
+
     // Add zdb import
     exe_debug.root_module.addImport("zdb", zdb_dep.module("zdb"));
 
-    // Auto-detect self-imports from source
-    const source_content = std.Io.Dir.cwd().readFileAlloc(io, main_path, b.allocator, .limited(10 * 1024 * 1024)) catch "";
-    defer b.allocator.free(source_content);
-
-    // Scan for @import("name") patterns that aren't std, zdb, or .zig files
-    var search_start: usize = 0;
-    while (std.mem.indexOf(u8, source_content[search_start..], "@import(\"")) |rel_pos| {
-        const pos = search_start + rel_pos;
-        const after = source_content[pos + 9 ..];
-
-        if (std.mem.indexOf(u8, after, "\")")) |end| {
-            const import_name = after[0..end];
-
-            // Skip std, zdb, and file imports (.zig extension)
-            const is_std = std.mem.eql(u8, import_name, "std");
-            const is_zdb = std.mem.eql(u8, import_name, "zdb");
-            const is_file = std.mem.endsWith(u8, import_name, ".zig");
-
-            if (!is_std and !is_zdb and !is_file) {
-                // Found a package import - add it
-                exe_debug.root_module.addImport(
-                    b.dupe(import_name),
-                    b.addModule(b.dupe(import_name), .{
-                        .root_source_file = b.path(options.package_root),
-                        .target = target,
-                        .optimize = optimize,
-                    }),
-                );
-            }
-
-            search_start = pos + 9 + end;
-        } else {
-            break;
+    // Copy ALL imports from original exe (zglfw, zmath, etc.)
+    var it = exe.root_module.import_table.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const module = entry.value_ptr.*;
+        if (!std.mem.eql(u8, name, "zdb")) {
+            exe_debug.root_module.addImport(name, module);
         }
     }
 

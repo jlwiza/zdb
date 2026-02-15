@@ -191,6 +191,7 @@ fn debugPrintValue(value: anytype, indent: usize, compact: bool) void {
         .int => std.debug.print("{}", .{value}),
         .float => std.debug.print("{d:.1}", .{value}),
         .bool => std.debug.print("{}", .{value}),
+        .@"fn" => std.debug.print("<fn>", .{}), // ADD THIS
         else => std.debug.print("{any}", .{value}),
     }
 }

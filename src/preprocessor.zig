@@ -32,6 +32,8 @@ const WalkContext = struct {
     allocator: std.mem.Allocator,
     fn_name: []const u8,
     enable_step: bool,
+    enable_live: bool,
+    input_file: []const u8,
     needs_debug: bool,
     // Track discard deletions per function — only commit if we actually inject code
     pending_discards: std.ArrayList(Edit) = .empty,
@@ -63,12 +65,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const input_file = args[1];
     const output_file = args[2];
     var enable_step = false;
+    var enable_live = false;
     var runtime_path: ?[]const u8 = null;
 
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--step")) {
             enable_step = true;
+        } else if (std.mem.eql(u8, args[i], "--live")) {
+            enable_live = true;
         } else if (std.mem.eql(u8, args[i], "--runtime-path") and i + 1 < args.len) {
             runtime_path = args[i + 1];
             i += 1;
@@ -92,7 +97,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const has_breakpoints = std.mem.indexOf(u8, source, "_ = .breakpoint;") != null;
     const has_step = std.mem.indexOf(u8, source, "step_debug()") != null;
-    const needs_debug = has_breakpoints or has_step or enable_step;
+    const needs_debug = has_breakpoints or has_step or enable_step or enable_live;
 
     if (!needs_debug) {
         if (is_build_file) {
@@ -145,6 +150,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .allocator = allocator,
         .fn_name = "",
         .enable_step = enable_step or has_step,
+        .enable_live = enable_live,
+        .input_file = input_file,
         .needs_debug = needs_debug,
     };
 
@@ -324,6 +331,18 @@ fn walkBlock(ctx: *WalkContext, block_node: Node.Index) WalkError!void {
                 .offset = insert_at,
                 .delete_len = 0,
                 .insert = try genStepDebug(ctx, trimmed, line_number, indent),
+            });
+            ctx.injected_in_fn = true;
+        }
+
+        // ---- Inject live breakpoint check ----
+        if (ctx.needs_debug and ctx.enable_live and isInjectableStatement(tag)) {
+            const insert_at = lineStartOffset(ctx.source, stmt_start);
+            const indent = getIndent(ctx.source, stmt_start);
+            try ctx.edits.append(ctx.allocator, .{
+                .offset = insert_at,
+                .delete_len = 0,
+                .insert = try genLiveCheck(ctx, line_number, indent),
             });
             ctx.injected_in_fn = true;
         }
@@ -635,6 +654,29 @@ fn genStepDebug(ctx: *WalkContext, line_text: []const u8, line_number: usize, in
     try buf.appendSlice(ctx.allocator, "\", \"");
     try appendEscaped(&buf, ctx.allocator, line_text);
     try buf.print(ctx.allocator, "\", {}, &var_names, var_values);\n", .{line_number});
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "}\n");
+    return buf.toOwnedSlice(ctx.allocator);
+}
+
+fn genLiveCheck(ctx: *WalkContext, line_number: usize, indent: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "if (!@inComptime()) {\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.print(ctx.allocator, "    if (zdb.live.shouldBreak(comptime zdb.live.compileFileHash(\"{s}\"), {})) {{\n", .{ ctx.input_file, line_number });
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "        const var_names = [_][]const u8{");
+    try appendVarNames(&buf, ctx);
+    try buf.appendSlice(ctx.allocator, "};\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "        const var_values = .{");
+    try appendVarValues(&buf, ctx);
+    try buf.appendSlice(ctx.allocator, "};\n");
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.print(ctx.allocator, "        zdb.live.onBreak(\"{s}\", comptime zdb.live.compileFileHash(\"{s}\"), {}, &var_names, var_values);\n", .{ ctx.fn_name, ctx.input_file, line_number });
+    try buf.appendSlice(ctx.allocator, indent);
+    try buf.appendSlice(ctx.allocator, "    }\n");
     try buf.appendSlice(ctx.allocator, indent);
     try buf.appendSlice(ctx.allocator, "}\n");
     return buf.toOwnedSlice(ctx.allocator);

@@ -15,6 +15,10 @@ pub const handleStep = runtime.handleStep;
 
 pub const addWatch = runtime.addWatch;
 pub const checkWatches = runtime.checkWatches;
+
+// Live breakpoint system
+pub const live = @import("live.zig");
+
 // Build helper function that users call from their build.zig
 pub fn addTo(
     b: *std.Build,
@@ -23,6 +27,7 @@ pub fn addTo(
         debug_step_name: []const u8 = "debug",
         processed_dir: []const u8 = "processed",
         enable_step_mode: bool = false,
+        enable_live_mode: bool = false,
         package_root: []const u8 = "src/root.zig",
     },
 ) void {
@@ -109,6 +114,9 @@ pub fn addTo(
     if (options.enable_step_mode) {
         preprocess_main.addArg("--step");
     }
+    if (options.enable_live_mode) {
+        preprocess_main.addArg("--live");
+    }
     preprocess_main.step.dependOn(&make_dir.step);
     // Build debug exe
     const exe_debug = b.addExecutable(.{
@@ -183,6 +191,9 @@ pub fn addTo(
         preprocess_file.addArg(output_path);
         if (options.enable_step_mode) {
             preprocess_file.addArg("--step");
+        }
+        if (options.enable_live_mode) {
+            preprocess_file.addArg("--live");
         }
         exe_debug.step.dependOn(&preprocess_file.step);
     }

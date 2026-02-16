@@ -60,13 +60,19 @@ var state_buf: [8 * 1024]u8 = undefined;
 var cmd_buf: [256]u8 = undefined;
 
 // Output buffer for variable inspection responses
-var output_buf: [16 * 1024]u8 = undefined;
+var output_buf: [32 * 1024]u8 = undefined;
 
 // String storage for breakpoint file/condition strings
 var string_buf: [16 * 1024]u8 = undefined;
 var string_pos: usize = 0;
 
 var initialized: bool = false;
+
+// Step mode state
+var step_mode: enum { none, step_in, step_over } = .none;
+var step_function_hash: u32 = 0; // for step_over: only break in same function
+var step_file_hash: u32 = 0; // for step_over: only break in same file
+var last_known_file: []const u8 = "unknown";
 
 // ============================================================================
 // Public API — called from instrumented code
@@ -80,6 +86,17 @@ pub fn shouldBreak(file_hash: u32, line: u32) bool {
 
     // Periodic poll for file changes
     pollForChanges();
+
+    // Step mode: break on next statement
+    if (step_mode == .step_in) {
+        return true;
+    }
+    if (step_mode == .step_over) {
+        // Only break if we're in the same file (same function scope)
+        if (file_hash == step_file_hash) {
+            return true;
+        }
+    }
 
     // Fast path: no breakpoints set
     if (breakpoint_count == 0) return false;
@@ -99,13 +116,19 @@ pub fn shouldBreak(file_hash: u32, line: u32) bool {
 /// Called when shouldBreak() returns true — handles the actual break
 pub fn onBreak(
     function_name: []const u8,
+    file_path: []const u8,
     file_hash: u32,
     line: u32,
     var_names: []const []const u8,
     var_values: anytype,
 ) void {
-    // Find the file path from our breakpoint list
-    const bp_file = findBreakpointFile(file_hash, line) orelse "unknown";
+    @setEvalBranchQuota(500_000);
+    // Use the file path passed directly from instrumented code
+    const bp_file = file_path;
+    last_known_file = bp_file;
+
+    // Clear step mode — we've landed, user will choose next action
+    step_mode = .none;
 
     std.debug.print("[zdb] BREAK: {s}:{} in {s}()\n", .{ bp_file, line, function_name });
 
@@ -124,10 +147,24 @@ pub fn onBreak(
 
         if (readCommandFile()) |cmd| {
             // Flow control
-            if (std.mem.eql(u8, cmd, "continue") or std.mem.eql(u8, cmd, "c")) break;
+            if (std.mem.eql(u8, cmd, "continue") or std.mem.eql(u8, cmd, "c")) {
+                step_mode = .none;
+                break;
+            }
             if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q")) std.process.exit(0);
-            if (std.mem.eql(u8, cmd, "step") or std.mem.eql(u8, cmd, "s") or
-                std.mem.eql(u8, cmd, "next") or std.mem.eql(u8, cmd, "n")) break;
+
+            // Step in: break on very next statement (any file/function)
+            if (std.mem.eql(u8, cmd, "step") or std.mem.eql(u8, cmd, "s")) {
+                step_mode = .step_in;
+                break;
+            }
+
+            // Step over: break on next statement in same file only
+            if (std.mem.eql(u8, cmd, "next") or std.mem.eql(u8, cmd, "n")) {
+                step_mode = .step_over;
+                step_file_hash = file_hash;
+                break;
+            }
 
             // "v" or "vars" — list all variables with values
             if (std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "vars")) {
@@ -142,14 +179,29 @@ pub fn onBreak(
             else
                 cmd;
 
-            // Try to match a variable name
+            // Try to match a variable name (exact or with .field path)
             var matched = false;
             const fields = @typeInfo(@TypeOf(var_values)).@"struct".fields;
             inline for (fields, 0..) |_, i| {
                 if (i < var_names.len) {
                     const name = var_names[i];
+
+                    // Exact match
                     if (std.mem.eql(u8, query, name)) {
                         writeVarDetail(name, var_values[i]);
+                        matched = true;
+                    }
+
+                    // Dot-path or bracket: "varname.field" or "varname[0..5]"
+                    if (!matched and query.len > name.len and
+                        std.mem.eql(u8, query[0..name.len], name) and
+                        (query[name.len] == '.' or query[name.len] == '['))
+                    {
+                        const path = if (query[name.len] == '.')
+                            query[name.len + 1 ..]
+                        else
+                            query[name.len..]; // include the [
+                        writeFieldAccess(name, var_values[i], path, 3);
                         matched = true;
                     }
                 }
@@ -479,6 +531,16 @@ fn findBreakpointFile(file_hash: u32, line: u32) ?[]const u8 {
     return null;
 }
 
+/// Find any breakpoint file matching this hash (for step mode, where line won't match)
+fn findFileByHash(file_hash: u32) ?[]const u8 {
+    for (breakpoints[0..breakpoint_count]) |bp| {
+        if (fileHashMatches(bp.file, file_hash)) {
+            return bp.file;
+        }
+    }
+    return null;
+}
+
 // ============================================================================
 // File-based debug communication
 //
@@ -493,6 +555,7 @@ fn writeStateFile(
     var_names: []const []const u8,
     var_values: anytype,
 ) void {
+    @setEvalBranchQuota(200_000);
     // Build state text manually into state_buf
     var pos: usize = 0;
 
@@ -513,8 +576,8 @@ fn writeStateFile(
         pos = appendSlice(&state_buf, pos, ": ");
         pos = appendSlice(&state_buf, pos, @typeName(@TypeOf(var_values[i])));
         pos = appendSlice(&state_buf, pos, " = ");
-        // Use formatValue which handles fn types, structs, etc.
-        pos = formatValue(&state_buf, pos, var_values[i], 0);
+        // Compact summary: depth 1 shows 1 level of struct fields
+        pos = formatValue(&state_buf, pos, var_values[i], 1, 1);
         pos = appendSlice(&state_buf, pos, "\n");
     }
 
@@ -535,7 +598,7 @@ fn writeVarDetail(name: []const u8, value: anytype) void {
     pos = appendSlice(&output_buf, pos, ": ");
     pos = appendSlice(&output_buf, pos, @typeName(@TypeOf(value)));
     pos = appendSlice(&output_buf, pos, "\n");
-    pos = formatValue(&output_buf, pos, value, 0);
+    pos = formatValue(&output_buf, pos, value, 3, 0);
     writeFileToCwd(config.output_file, output_buf[0..pos]);
 }
 
@@ -548,7 +611,7 @@ fn writeAllVars(var_names: []const []const u8, var_values: anytype) void {
         pos = appendSlice(&output_buf, pos, "  ");
         pos = appendSlice(&output_buf, pos, name);
         pos = appendSlice(&output_buf, pos, " = ");
-        pos = formatValue(&output_buf, pos, var_values[i], 1);
+        pos = formatValue(&output_buf, pos, var_values[i], 1, 1);
         if (pos < output_buf.len) {
             output_buf[pos] = '\n';
             pos += 1;
@@ -558,138 +621,353 @@ fn writeAllVars(var_names: []const []const u8, var_values: anytype) void {
 }
 
 // ============================================================================
-// Value formatter — writes human-readable representation to buffer
-// Handles structs, arrays, slices, enums, optionals, primitives.
+// Field path access — traverse "field.subfield[N..M]" paths at comptime
 // ============================================================================
 
-fn formatValue(buf: []u8, start: usize, value: anytype, depth: usize) usize {
+fn writeFieldAccess(name: []const u8, root_value: anytype, path: []const u8, comptime depth: u32) void {
+    @setEvalBranchQuota(200_000);
+    const T = @TypeOf(root_value);
+    const info = @typeInfo(T);
+
+    // 1. Deref single pointers (doesn't consume depth)
+    if (comptime info == .pointer and info.pointer.size == .one) {
+        const child_info = @typeInfo(info.pointer.child);
+        if (comptime child_info == .@"opaque" or child_info == .@"fn") {
+            writeOutput("Cannot inspect opaque/fn pointer fields");
+            return;
+        }
+        return writeFieldAccess(name, root_value.*, path, depth);
+    }
+
+    // 2. Unwrap optionals (doesn't consume depth)
+    if (comptime info == .optional) {
+        if (root_value) |v| {
+            return writeFieldAccess(name, v, path, depth);
+        } else {
+            writeOutput("Value is null");
+            return;
+        }
+    }
+
+    // 3. Bracket access at current level (doesn't need depth)
+    if (path.len > 0 and path[0] == '[') {
+        showSliceRange(root_value, path);
+        return;
+    }
+
+    // 4. If no path left, format the value
+    if (path.len == 0) {
+        writeVarDetail(name, root_value);
+        return;
+    }
+
+    // 5. Check depth for further struct traversal
+    if (depth == 0) {
+        writeOutput("Path too deep (max 3 levels)");
+        return;
+    }
+
+    // 6. Must be a struct for field access
+    if (comptime info != .@"struct") {
+        writeOutput("Not a struct, cannot access fields");
+        return;
+    }
+
+    // 7. Guard against huge structs (compile-time explosion)
+    if (comptime info.@"struct".fields.len > 20) {
+        writeOutput("Struct too large for field access");
+        return;
+    }
+
+    // 8. Parse field name from path (up to next '.' or '[')
+    var field_end: usize = 0;
+    while (field_end < path.len and path[field_end] != '.' and path[field_end] != '[') {
+        field_end += 1;
+    }
+    const field_name = path[0..field_end];
+
+    // 9. Comptime field lookup
+    var found = false;
+    inline for (info.@"struct".fields) |field| {
+        if (std.mem.eql(u8, field.name, field_name)) {
+            found = true;
+            const field_val = @field(root_value, field.name);
+
+            if (field_end >= path.len) {
+                // End of path — show full detail
+                writeVarDetail(field_name, field_val);
+            } else if (path[field_end] == '.') {
+                // More field traversal
+                writeFieldAccess(name, field_val, path[field_end + 1 ..], depth - 1);
+            } else {
+                // '[' — bracket access on this field
+                showSliceRange(field_val, path[field_end..]);
+            }
+        }
+    }
+
+    if (!found) {
+        var p: usize = 0;
+        p = appendSlice(&output_buf, p, "No field '");
+        p = appendSlice(&output_buf, p, field_name);
+        p = appendSlice(&output_buf, p, "' on ");
+        p = appendSlice(&output_buf, p, shortTypeName(T));
+        writeFileToCwd(config.output_file, output_buf[0..p]);
+    }
+}
+
+/// Parse "[N]" or "[N..M]" from a bracket expression string.
+/// Returns start index and optional end index.
+fn parseBracketRange(expr: []const u8) struct { start: usize, end: ?usize } {
+    // Skip leading [
+    var i: usize = if (expr.len > 0 and expr[0] == '[') 1 else 0;
+
+    // Parse start number
+    var start: usize = 0;
+    while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') : (i += 1) {
+        start = start * 10 + @as(usize, expr[i] - '0');
+    }
+
+    // Check for ..
+    if (i + 1 < expr.len and expr[i] == '.' and expr[i + 1] == '.') {
+        i += 2;
+        var end_val: usize = 0;
+        while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') : (i += 1) {
+            end_val = end_val * 10 + @as(usize, expr[i] - '0');
+        }
+        return .{ .start = start, .end = end_val };
+    }
+
+    // Single index [N] — show just that element
+    return .{ .start = start, .end = null };
+}
+
+/// Show slice/array elements for a bracket range expression like "[1..4]" or "[0]"
+fn showSliceRange(value: anytype, bracket_expr: []const u8) void {
+    const T = @TypeOf(value);
+    const info = @typeInfo(T);
+
+    // Deref pointers
+    if (comptime info == .pointer and info.pointer.size == .one) {
+        if (comptime @typeInfo(info.pointer.child) == .@"opaque" or @typeInfo(info.pointer.child) == .@"fn") {
+            writeOutput("Cannot index opaque/fn pointer");
+            return;
+        }
+        return showSliceRange(value.*, bracket_expr);
+    }
+
+    // Handle slices
+    if (comptime info == .pointer and info.pointer.size == .slice) {
+        const range = parseBracketRange(bracket_expr);
+
+        if (range.start >= value.len) {
+            writeOutput("Index out of bounds");
+            return;
+        }
+
+        if (range.end) |end_req| {
+            // Range [N..M]
+            const end = @min(end_req, value.len);
+            var pos: usize = 0;
+            pos = appendSlice(&output_buf, pos, "[");
+            pos = appendInt(&output_buf, pos, @intCast(range.start));
+            pos = appendSlice(&output_buf, pos, "..");
+            pos = appendInt(&output_buf, pos, @intCast(end));
+            pos = appendSlice(&output_buf, pos, "] (");
+            pos = appendInt(&output_buf, pos, @intCast(end - range.start));
+            pos = appendSlice(&output_buf, pos, " items)\n");
+
+            var idx = range.start;
+            for (value[range.start..end]) |item| {
+                pos = appendIndent(&output_buf, pos, 1);
+                pos = appendSlice(&output_buf, pos, "[");
+                pos = appendInt(&output_buf, pos, @intCast(idx));
+                pos = appendSlice(&output_buf, pos, "] ");
+                pos = formatValue(&output_buf, pos, item, 2, 1);
+                pos = appendSlice(&output_buf, pos, "\n");
+                idx += 1;
+            }
+            writeFileToCwd(config.output_file, output_buf[0..pos]);
+        } else {
+            // Single index [N]
+            var pos: usize = 0;
+            pos = appendSlice(&output_buf, pos, "[");
+            pos = appendInt(&output_buf, pos, @intCast(range.start));
+            pos = appendSlice(&output_buf, pos, "]\n");
+            pos = formatValue(&output_buf, pos, value[range.start], 3, 0);
+            writeFileToCwd(config.output_file, output_buf[0..pos]);
+        }
+        return;
+    }
+
+    // Handle arrays (coerce to slice)
+    if (comptime info == .array) {
+        const slice: []const info.array.child = &value;
+        return showSliceRange(slice, bracket_expr);
+    }
+
+    writeOutput("Cannot index: not a slice or array");
+}
+
+/// Get a clean short type name. Handles generics properly:
+///   std.array_list.ArrayListAligned(Animation.Frame,null) → ArrayList(Frame)
+///   timeline.AnimationTimeline → AnimationTimeline
+///   usize → usize
+fn shortTypeName(comptime T: type) []const u8 {
+    const full = @typeName(T);
+    const paren = comptime std.mem.indexOfScalar(u8, full, '(') orelse full.len;
+    const base = full[0..paren];
+    const last_dot = comptime std.mem.lastIndexOfScalar(u8, base, '.');
+    if (last_dot) |dot| {
+        return full[dot + 1 ..];
+    }
+    return full;
+}
+
+fn formatValue(buf: []u8, start: usize, value: anytype, comptime max_depth: u32, indent: usize) usize {
+    @setEvalBranchQuota(200_000);
     const T = @TypeOf(value);
     const info = @typeInfo(T);
     var pos = start;
 
-    if (depth > 4) {
-        pos = appendSlice(buf, pos, "(...)");
-        return pos;
-    }
-
+    // Primitives ALWAYS show values regardless of depth
     switch (info) {
         .int => {
-            // Use bufPrint for ints
             var tmp: [24]u8 = undefined;
             const s = std.fmt.bufPrint(&tmp, "{}", .{value}) catch "?";
-            pos = appendSlice(buf, pos, s);
+            return appendSlice(buf, pos, s);
         },
         .float => {
             var tmp: [32]u8 = undefined;
             const s = std.fmt.bufPrint(&tmp, "{d:.4}", .{value}) catch "?";
-            pos = appendSlice(buf, pos, s);
+            return appendSlice(buf, pos, s);
         },
-        .bool => {
-            pos = appendSlice(buf, pos, if (value) "true" else "false");
-        },
+        .bool => return appendSlice(buf, pos, if (value) "true" else "false"),
         .@"enum" => {
             pos = appendSlice(buf, pos, ".");
-            pos = appendSlice(buf, pos, @tagName(value));
+            return appendSlice(buf, pos, @tagName(value));
         },
+        .@"fn" => return appendSlice(buf, pos, "<fn>"),
+        else => {},
+    }
+
+    // For containers, stop at depth limit
+    if (max_depth == 0) {
+        pos = appendSlice(buf, pos, shortTypeName(T));
+        return pos;
+    }
+
+    switch (info) {
         .optional => {
             if (value) |v| {
-                pos = formatValue(buf, pos, v, depth);
+                pos = formatValue(buf, pos, v, max_depth, indent);
             } else {
                 pos = appendSlice(buf, pos, "null");
             }
         },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
-                // String slice
+                // String — truncate at 120 chars
                 pos = appendSlice(buf, pos, "\"");
-                const str = if (value.len > 200) value[0..200] else value;
+                const str = if (value.len > 120) value[0..120] else value;
                 pos = appendSlice(buf, pos, str);
-                if (value.len > 200) pos = appendSlice(buf, pos, "...");
+                if (value.len > 120) {
+                    pos = appendSlice(buf, pos, "...(");
+                    pos = appendInt(buf, pos, @intCast(value.len));
+                    pos = appendSlice(buf, pos, " bytes)");
+                }
                 pos = appendSlice(buf, pos, "\"");
             } else if (ptr.size == .slice) {
-                // Other slices — show elements
-                pos = appendSlice(buf, pos, "[\n");
+                pos = appendSlice(buf, pos, "[](");
+                pos = appendInt(buf, pos, @intCast(value.len));
+                pos = appendSlice(buf, pos, " items)\n");
                 const show = if (value.len > 20) @as(usize, 20) else value.len;
                 for (value[0..show], 0..) |item, idx| {
-                    pos = appendIndent(buf, pos, depth + 1);
+                    pos = appendIndent(buf, pos, indent + 1);
                     pos = appendSlice(buf, pos, "[");
                     pos = appendInt(buf, pos, @intCast(idx));
                     pos = appendSlice(buf, pos, "] ");
-                    pos = formatValue(buf, pos, item, depth + 1);
+                    pos = formatValue(buf, pos, item, max_depth - 1, indent + 1);
                     pos = appendSlice(buf, pos, "\n");
                 }
                 if (value.len > 20) {
-                    pos = appendIndent(buf, pos, depth + 1);
+                    pos = appendIndent(buf, pos, indent + 1);
                     pos = appendSlice(buf, pos, "... (");
                     pos = appendInt(buf, pos, @intCast(value.len));
                     pos = appendSlice(buf, pos, " items total)\n");
                 }
-                pos = appendIndent(buf, pos, depth);
+                pos = appendIndent(buf, pos, indent);
                 pos = appendSlice(buf, pos, "]");
+            } else if (ptr.size == .one) {
+                const child_info = @typeInfo(ptr.child);
+                if (child_info == .@"opaque" or child_info == .@"fn") {
+                    pos = appendSlice(buf, pos, shortTypeName(ptr.child));
+                } else {
+                    pos = formatValue(buf, pos, value.*, max_depth - 1, indent);
+                }
             } else {
-                // Other pointer — show address
-                var tmp: [24]u8 = undefined;
-                const s = std.fmt.bufPrint(&tmp, "{*}", .{value}) catch "ptr";
-                pos = appendSlice(buf, pos, s);
+                pos = appendSlice(buf, pos, "ptr");
             }
         },
         .array => |arr| {
             if (arr.child == u8) {
                 pos = appendSlice(buf, pos, "\"");
                 const str: []const u8 = &value;
-                const show = if (str.len > 200) str[0..200] else str;
-                pos = appendSlice(buf, pos, show);
-                if (str.len > 200) pos = appendSlice(buf, pos, "...");
+                const show_str = if (str.len > 120) str[0..120] else str;
+                pos = appendSlice(buf, pos, show_str);
+                if (str.len > 120) {
+                    pos = appendSlice(buf, pos, "...(");
+                    pos = appendInt(buf, pos, @intCast(str.len));
+                    pos = appendSlice(buf, pos, " bytes)");
+                }
                 pos = appendSlice(buf, pos, "\"");
             } else {
-                pos = appendSlice(buf, pos, "[\n");
                 const items: []const arr.child = &value;
+                pos = appendSlice(buf, pos, "[](");
+                pos = appendInt(buf, pos, @intCast(items.len));
+                pos = appendSlice(buf, pos, " items)\n");
                 const show = if (items.len > 20) @as(usize, 20) else items.len;
                 for (items[0..show], 0..) |item, idx| {
-                    pos = appendIndent(buf, pos, depth + 1);
+                    pos = appendIndent(buf, pos, indent + 1);
                     pos = appendSlice(buf, pos, "[");
                     pos = appendInt(buf, pos, @intCast(idx));
                     pos = appendSlice(buf, pos, "] ");
-                    pos = formatValue(buf, pos, item, depth + 1);
+                    pos = formatValue(buf, pos, item, max_depth - 1, indent + 1);
                     pos = appendSlice(buf, pos, "\n");
                 }
                 if (items.len > 20) {
-                    pos = appendIndent(buf, pos, depth + 1);
+                    pos = appendIndent(buf, pos, indent + 1);
                     pos = appendSlice(buf, pos, "... (");
                     pos = appendInt(buf, pos, @intCast(items.len));
                     pos = appendSlice(buf, pos, " items total)\n");
                 }
-                pos = appendIndent(buf, pos, depth);
+                pos = appendIndent(buf, pos, indent);
                 pos = appendSlice(buf, pos, "]");
             }
         },
         .@"struct" => |s| {
+            const short = shortTypeName(T);
             if (s.fields.len == 0) {
                 pos = appendSlice(buf, pos, "{}");
+            } else if (s.fields.len > 16) {
+                pos = appendSlice(buf, pos, short);
+                pos = appendSlice(buf, pos, "{ ... }");
             } else {
-                // Get short type name
-                const type_name = @typeName(T);
-                if (std.mem.lastIndexOfScalar(u8, type_name, '.')) |dot| {
-                    pos = appendSlice(buf, pos, type_name[dot + 1 ..]);
-                }
+                pos = appendSlice(buf, pos, short);
                 pos = appendSlice(buf, pos, "{\n");
                 inline for (s.fields) |field| {
-                    pos = appendIndent(buf, pos, depth + 1);
+                    pos = appendIndent(buf, pos, indent + 1);
                     pos = appendSlice(buf, pos, ".");
                     pos = appendSlice(buf, pos, field.name);
                     pos = appendSlice(buf, pos, " = ");
-                    pos = formatValue(buf, pos, @field(value, field.name), depth + 1);
+                    pos = formatValue(buf, pos, @field(value, field.name), max_depth - 1, indent + 1);
                     pos = appendSlice(buf, pos, "\n");
                 }
-                pos = appendIndent(buf, pos, depth);
+                pos = appendIndent(buf, pos, indent);
                 pos = appendSlice(buf, pos, "}");
             }
         },
-        .@"fn" => {
-            pos = appendSlice(buf, pos, "<fn>");
-        },
         else => {
-            // Fallback
             var tmp: [128]u8 = undefined;
             const s = std.fmt.bufPrint(&tmp, "{any}", .{value}) catch "?";
             pos = appendSlice(buf, pos, s);

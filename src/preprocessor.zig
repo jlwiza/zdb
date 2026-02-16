@@ -674,7 +674,7 @@ fn genLiveCheck(ctx: *WalkContext, line_number: usize, indent: []const u8) ![]co
     try appendVarValues(&buf, ctx);
     try buf.appendSlice(ctx.allocator, "};\n");
     try buf.appendSlice(ctx.allocator, indent);
-    try buf.print(ctx.allocator, "        zdb.live.onBreak(\"{s}\", comptime zdb.live.compileFileHash(\"{s}\"), {}, &var_names, var_values);\n", .{ ctx.fn_name, ctx.input_file, line_number });
+    try buf.print(ctx.allocator, "        zdb.live.onBreak(\"{s}\", \"{s}\", comptime zdb.live.compileFileHash(\"{s}\"), {}, &var_names, var_values);\n", .{ ctx.fn_name, ctx.input_file, ctx.input_file, line_number });
     try buf.appendSlice(ctx.allocator, indent);
     try buf.appendSlice(ctx.allocator, "    }\n");
     try buf.appendSlice(ctx.allocator, indent);

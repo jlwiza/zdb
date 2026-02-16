@@ -1,5 +1,5 @@
 const std = @import("std");
-const Timer = @import("util_timer.zig").Timer;
+
 // Global state for debugging
 pub var step_mode: bool = false;
 // FIXED: Now using a stack of functions instead of single function
@@ -7,7 +7,7 @@ pub var step_functions: [32]?[]const u8 = [_]?[]const u8{null} ** 32;
 pub var step_function_count: usize = 0;
 var watch_expressions: []const WatchExpr = &.{};
 var breakpoint_count: usize = 0;
-var breakpoint_timer: ?Timer = null;
+var breakpoint_timestamp: ?std.Io.Timestamp = null;
 
 pub var runtime: Runtime = .{};
 
@@ -54,13 +54,10 @@ fn addFunctionToStepStack(function_name: []const u8) void {
 
 // Auto-trim the stack when we return to a function
 fn autoTrimStepStack(function_name: []const u8) void {
-    // If we're back in a function that's already on the stack,
-    // we must have returned from deeper calls
     var i: usize = 0;
     while (i < step_function_count) : (i += 1) {
         if (step_functions[i]) |sf| {
             if (std.mem.eql(u8, sf, function_name)) {
-                // Trim everything after this function
                 step_function_count = i + 1;
                 return;
             }
@@ -92,11 +89,9 @@ pub fn debugPrintWithPage(name: []const u8, value: anytype, page: usize) void {
 
             const child_type = if (type_info == .array) type_info.array.child else type_info.pointer.child;
             if (@typeInfo(child_type) == .@"struct") {
-                // Struct array - use table format
                 std.debug.print("{s} (page {}/{}): ", .{ name, page + 1, (array_len + 9) / 10 });
                 debugPrintStructArray(value[start..end], start);
             } else {
-                // Simple array - show the page
                 std.debug.print("{s}[{}..{}] (page {}/{} of {} items) = ", .{ name, start, end, page + 1, (array_len + 9) / 10, array_len });
                 debugPrintValue(value[start..end], 0, false);
                 std.debug.print("\n", .{});
@@ -105,7 +100,6 @@ pub fn debugPrintWithPage(name: []const u8, value: anytype, page: usize) void {
         }
     }
 
-    // Default printing for small arrays or non-arrays
     std.debug.print("{s} = ", .{name});
     debugPrintValue(value, 0, false);
     std.debug.print("\n", .{});
@@ -126,7 +120,6 @@ pub fn debugPrintRange(name: []const u8, value: anytype, start: usize, end: usiz
             return;
         }
 
-        // Check if all elements are the same struct type
         if (type_info == .array) {
             if (@typeInfo(type_info.array.child) == .@"struct") {
                 debugPrintStructArray(value[actual_start..actual_end], actual_start);
@@ -134,7 +127,6 @@ pub fn debugPrintRange(name: []const u8, value: anytype, start: usize, end: usiz
             }
         }
 
-        // Default array printing
         std.debug.print("[\n", .{});
         var i = actual_start;
         while (i < actual_end) : (i += 1) {
@@ -157,14 +149,12 @@ fn debugPrintValue(value: anytype, indent: usize, compact: bool) void {
             if (ptr.size == .slice and ptr.child == u8) {
                 std.debug.print("\"{s}\"", .{value});
             } else if (ptr.size == .slice) {
-                // Check if it's an array of structs for table format
                 if (@typeInfo(ptr.child) == .@"struct" and value.len > 0) {
                     debugPrintStructArray(value, 0);
                 } else {
                     debugPrintSimpleArray(value, indent, compact);
                 }
             } else {
-                // Just use Zig's any formatter for other pointers
                 std.debug.print("{any}", .{value});
             }
         },
@@ -191,7 +181,7 @@ fn debugPrintValue(value: anytype, indent: usize, compact: bool) void {
         .int => std.debug.print("{}", .{value}),
         .float => std.debug.print("{d:.1}", .{value}),
         .bool => std.debug.print("{}", .{value}),
-        .@"fn" => std.debug.print("<fn>", .{}), // ADD THIS
+        .@"fn" => std.debug.print("<fn>", .{}),
         else => std.debug.print("{any}", .{value}),
     }
 }
@@ -200,7 +190,6 @@ fn debugPrintSimpleArray(value: anytype, indent: usize, compact: bool) void {
     _ = compact;
     const len = value.len;
 
-    // For simple types, use compact inline format
     if (len <= 20) {
         std.debug.print("[ ", .{});
         for (value, 0..) |item, i| {
@@ -209,7 +198,6 @@ fn debugPrintSimpleArray(value: anytype, indent: usize, compact: bool) void {
         }
         std.debug.print(" ]", .{});
     } else {
-        // Show first 10, then ellipsis
         std.debug.print("[ ", .{});
         for (0..@min(10, len)) |i| {
             if (i > 0) std.debug.print(", ", .{});
@@ -233,7 +221,6 @@ fn debugPrintStruct(value: anytype, indent: usize, compact: bool) void {
     const type_name = @typeName(T);
     const is_anon = std.mem.indexOf(u8, type_name, "__struct_") != null;
 
-    // For position-like structs, use compact (x, y) format
     if (is_anon and fields.len == 2 and
         @hasField(T, "x") and @hasField(T, "y"))
     {
@@ -263,7 +250,6 @@ fn debugPrintStruct(value: anytype, indent: usize, compact: bool) void {
         }
         std.debug.print(" }}", .{});
     } else {
-        // Multi-line format for complex structs
         if (!is_anon) {
             if (std.mem.lastIndexOf(u8, type_name, ".")) |dot_pos| {
                 std.debug.print("{s}{{\n", .{type_name[dot_pos + 1 ..]});
@@ -294,20 +280,17 @@ fn debugPrintStructArray(items: anytype, start_index: usize) void {
     const T = @TypeOf(items[0]);
     const fields = @typeInfo(T).@"struct".fields;
 
-    // Determine how many items to show (max 10 for table format)
     const items_to_show = @min(items.len, 10);
     const show_items = items[0..items_to_show];
 
     std.debug.print("[\n", .{});
 
-    // Print header with indices
     std.debug.print("            ", .{});
     for (show_items, 0..) |_, i| {
         std.debug.print("[{d:<2}]            ", .{start_index + i});
     }
     std.debug.print("\n", .{});
 
-    // Print each field as a row
     inline for (fields) |field| {
         std.debug.print("  {s:<9} ", .{field.name ++ ":"});
         for (show_items) |item| {
@@ -317,7 +300,6 @@ fn debugPrintStructArray(items: anytype, start_index: usize) void {
             if (T2 == []const u8 or T2 == []u8) {
                 std.debug.print("{s:<15} ", .{val});
             } else if (@typeInfo(T2) == .@"struct") {
-                // Special handling for position
                 const info = @typeInfo(T2);
                 if (info.@"struct".fields.len == 2) {
                     const f1 = info.@"struct".fields[0];
@@ -356,34 +338,27 @@ pub fn handleBreakpoint(
 ) void {
     breakpoint_count += 1;
 
-    // Time tracking
-    if (breakpoint_timer) |last| {
-        const elapsed_ns = last.read();
-        std.debug.print("\n[Time since last breakpoint: {}ms]\n", .{
-            elapsed_ns / std.time.ns_per_ms,
-        });
+    // Time tracking using std.Io clock
+    const io = runtime.io();
+    const now = std.Io.Clock.awake.now(io);
+
+    if (breakpoint_timestamp) |last| {
+        const elapsed = last.durationTo(now);
+        const elapsed_ms = @divTrunc(elapsed.nanoseconds, std.time.ns_per_ms);
+        std.debug.print("\n[Time since last breakpoint: {}ms]\n", .{elapsed_ms});
     }
-    breakpoint_timer = Timer.start() catch null;
-    // Check if we're in a build.zig context
+    breakpoint_timestamp = now;
+
     const is_build_context = std.mem.eql(u8, function_name, "build");
 
     std.debug.print("\n=== BREAKPOINT #{} in {s}() ===\n", .{ breakpoint_count, function_name });
 
     if (is_build_context) {
-        std.debug.print("(Build.zig detected", .{});
+        std.debug.print("(Build.zig detected)\n", .{});
         std.debug.print("For interactive debugging, run: zig build <args> 2>&1 | cat\n", .{});
-        // Print all variables automatically
-        // inline for (var_values, 0..) |value, idx| {
-        //     const name = var_names[idx];
-        //     std.debug.print("  ", .{});
-        //     debugPrint(name, value);
-        // }
-        // std.debug.print("\nContinuing...\n", .{});
-        // return; // Skip interactive loop
     }
 
-    // Normal interactive mode for non-build contexts
-    const io = runtime.io();
+    // Normal interactive mode
     var stdin_buf: [256]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, stdin_buf[0..]);
     const r = &stdin_reader.interface;
@@ -400,7 +375,6 @@ pub fn handleBreakpoint(
 
     while (true) {
         std.debug.print("> ", .{});
-        // Add debug output to see what's happening
         const maybe_line = r.takeDelimiter('\n') catch |err| {
             std.debug.print("Error reading stdin: {}\n", .{err});
             break;
@@ -418,12 +392,10 @@ pub fn handleBreakpoint(
                 break;
             }
 
-            // Handle variable inspection
             var handled = false;
             inline for (var_values, 0..) |value, idx| {
                 const name = var_names[idx];
 
-                // Check for exact match
                 if (std.mem.eql(u8, cmd, name)) {
                     debugPrint(name, value);
                     last_array_name = name;
@@ -432,7 +404,6 @@ pub fn handleBreakpoint(
                     break;
                 }
 
-                // Check for "print <var>" format
                 if (cmd.len > 6 and std.mem.startsWith(u8, cmd, "print ")) {
                     const var_part = cmd[6..];
                     if (std.mem.eql(u8, var_part, name)) {
@@ -444,7 +415,6 @@ pub fn handleBreakpoint(
                     }
                 }
 
-                // Handle paging
                 if ((std.mem.eql(u8, cmd, "n") or std.mem.eql(u8, cmd, "p")) and
                     std.mem.eql(u8, last_array_name, name))
                 {
@@ -458,7 +428,6 @@ pub fn handleBreakpoint(
                     break;
                 }
 
-                // Handle range syntax
                 if (std.mem.startsWith(u8, cmd, name) and cmd.len > name.len and cmd[name.len] == '[') {
                     const bracket_part = cmd[name.len..];
                     if (std.mem.indexOf(u8, bracket_part, "..")) |dots| {
@@ -492,10 +461,7 @@ pub fn handleStepBefore(
     var_names: []const []const u8,
     var_values: anytype,
 ) void {
-    // Auto-trim stack if we've returned to a function already on it
     autoTrimStepStack(function_name);
-
-    // Check if we should step in this function
     if (!shouldStepInFunction(function_name)) return;
 
     std.debug.print("\n[{s}:{d}] about to execute: {s}\n", .{ function_name, line_number, next_line });
@@ -512,18 +478,14 @@ pub fn handleStepBefore(
             const cmd = std.mem.trim(u8, input, " \t\r\n");
 
             if (std.mem.eql(u8, cmd, "s") or cmd.len == 0) {
-                // Step to next line
                 break;
             } else if (std.mem.eql(u8, cmd, "c")) {
-                // Continue without stepping
                 step_mode = false;
                 step_function_count = 0;
                 break;
             } else if (std.mem.eql(u8, cmd, "n")) {
-                // Next - step over function calls
                 break;
             } else if (std.mem.eql(u8, cmd, "v")) {
-                // Show all variables
                 std.debug.print("Variables:\n", .{});
                 inline for (var_values, 0..) |value, idx| {
                     const name = var_names[idx];
@@ -531,7 +493,6 @@ pub fn handleStepBefore(
                     debugPrint(name, value);
                 }
             } else {
-                // Try to print specific variable
                 var found = false;
                 inline for (var_values, 0..) |value, idx| {
                     const name = var_names[idx];
@@ -557,7 +518,6 @@ pub fn handleStep(
     var_names: []const []const u8,
     var_values: anytype,
 ) void {
-    // Check runtime step mode and function
     if (!shouldStepInFunction(function_name)) return;
 
     std.debug.print("\n[{s}:{d}] executed: {s}\n", .{ function_name, line_number, executed_line });
@@ -565,7 +525,7 @@ pub fn handleStep(
 
     const io = runtime.io();
     var stdin_buf: [256]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(io, stdin_buf[0..]);
+    var stdin_reader = std.Io.File.stdin().reader(io, stdin_buf[0..]);
     const r = &stdin_reader.interface;
 
     while (true) {
@@ -574,19 +534,14 @@ pub fn handleStep(
             const cmd = std.mem.trim(u8, input, " \t\r\n");
 
             if (std.mem.eql(u8, cmd, "s") or cmd.len == 0) {
-                // Step to next line
                 break;
             } else if (std.mem.eql(u8, cmd, "c")) {
-                // Continue without stepping
                 step_mode = false;
                 step_function_count = 0;
                 break;
             } else if (std.mem.eql(u8, cmd, "n")) {
-                // Next - step over function calls
-                // For now, same as step, but could be enhanced
                 break;
             } else if (std.mem.eql(u8, cmd, "v")) {
-                // Show all variables
                 std.debug.print("Variables:\n", .{});
                 inline for (var_values, 0..) |value, idx| {
                     const name = var_names[idx];
@@ -594,7 +549,6 @@ pub fn handleStep(
                     debugPrint(name, value);
                 }
             } else {
-                // Try to print specific variable
                 var found = false;
                 inline for (var_values, 0..) |value, idx| {
                     const name = var_names[idx];
@@ -614,7 +568,6 @@ pub fn handleStep(
 
 // Watch expression support
 pub fn addWatch(name: []const u8, check_fn: *const fn () bool) void {
-    // In real implementation, we'd need dynamic allocation
     _ = name;
     _ = check_fn;
     std.debug.print("Watch expressions not yet implemented\n", .{});
@@ -624,7 +577,6 @@ pub fn checkWatches() void {
     for (watch_expressions) |watch| {
         if (watch.check_fn()) {
             std.debug.print("\n!!! WATCH HIT: {s} !!!\n", .{watch.name});
-            // Could trigger a breakpoint here
         }
     }
 }

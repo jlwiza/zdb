@@ -27,7 +27,44 @@ pub const Runtime = struct {
         return self.threaded.io();
     }
 };
+pub fn canAddress(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .comptime_int, .comptime_float, .type, .null, .undefined, .enum_literal => false,
+        else => true,
+    };
+}
 
+fn SnapValue(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| if (p.size == .one) p.child else T,
+        .comptime_int => i128,
+        .comptime_float => f64,
+        else => T,
+    };
+}
+
+fn RebuiltTuple(comptime Ptrs: type) type {
+    const src = @typeInfo(Ptrs).@"struct".fields;
+    var types: [src.len]type = undefined;
+    inline for (src, 0..) |f, i| {
+        types[i] = SnapValue(f.type);
+    }
+    return std.meta.Tuple(&types);
+}
+
+pub fn rebuild(ptrs: anytype) RebuiltTuple(@TypeOf(ptrs)) {
+    const fields = @typeInfo(@TypeOf(ptrs)).@"struct".fields;
+    var out: RebuiltTuple(@TypeOf(ptrs)) = undefined;
+    inline for (fields, 0..) |f, i| {
+        const ti = @typeInfo(f.type);
+        if (comptime ti == .pointer and ti.pointer.size == .one) {
+            out[i] = ptrs[i].*;
+        } else {
+            out[i] = ptrs[i];
+        }
+    }
+    return out;
+}
 // Check if we should step in the current function
 fn shouldStepInFunction(function_name: []const u8) bool {
     if (!step_mode) return false;
@@ -300,11 +337,12 @@ fn debugPrintStructArray(items: anytype, start_index: usize) void {
             if (T2 == []const u8 or T2 == []u8) {
                 std.debug.print("{s:<15} ", .{val});
             } else if (@typeInfo(T2) == .@"struct") {
-                const info = @typeInfo(T2);
-                if (info.@"struct".fields.len == 2) {
-                    const f1 = info.@"struct".fields[0];
-                    const f2 = info.@"struct".fields[1];
-                    if (std.mem.eql(u8, f1.name, "x") and std.mem.eql(u8, f2.name, "y")) {
+                const is_point = comptime (@typeInfo(T2).@"struct".fields.len == 2 and
+                    @hasField(T2, "x") and @hasField(T2, "y"));
+                if (is_point) {
+                    const x_is_float = @typeInfo(@TypeOf(@field(val, "x"))) == .float;
+                    const y_is_float = @typeInfo(@TypeOf(@field(val, "y"))) == .float;
+                    if (x_is_float and y_is_float) {
                         std.debug.print("({d:.1}, {d:.1})     ", .{ @field(val, "x"), @field(val, "y") });
                         continue;
                     }
@@ -464,6 +502,7 @@ pub fn handleStepBefore(
     autoTrimStepStack(function_name);
     if (!shouldStepInFunction(function_name)) return;
 
+    const vv = rebuild(var_values); // <-- add this
     std.debug.print("\n[{s}:{d}] about to execute: {s}\n", .{ function_name, line_number, next_line });
     std.debug.print("(s=step, c=continue, n=next, v=vars, or variable name)\n", .{});
 
@@ -487,14 +526,14 @@ pub fn handleStepBefore(
                 break;
             } else if (std.mem.eql(u8, cmd, "v")) {
                 std.debug.print("Variables:\n", .{});
-                inline for (var_values, 0..) |value, idx| {
+                inline for (vv, 0..) |value, idx| {
                     const name = var_names[idx];
                     std.debug.print("  ", .{});
                     debugPrint(name, value);
                 }
             } else {
                 var found = false;
-                inline for (var_values, 0..) |value, idx| {
+                inline for (vv, 0..) |value, idx| {
                     const name = var_names[idx];
                     if (std.mem.eql(u8, cmd, name)) {
                         debugPrint(name, value);
@@ -520,6 +559,8 @@ pub fn handleStep(
 ) void {
     if (!shouldStepInFunction(function_name)) return;
 
+    const vv = rebuild(var_values); // <-- add this
+
     std.debug.print("\n[{s}:{d}] executed: {s}\n", .{ function_name, line_number, executed_line });
     std.debug.print("(s=step, c=continue, n=next (skip calls), v=vars, or variable name)\n", .{});
 
@@ -543,14 +584,14 @@ pub fn handleStep(
                 break;
             } else if (std.mem.eql(u8, cmd, "v")) {
                 std.debug.print("Variables:\n", .{});
-                inline for (var_values, 0..) |value, idx| {
+                inline for (vv, 0..) |value, idx| { // was var_values
                     const name = var_names[idx];
                     std.debug.print("  ", .{});
                     debugPrint(name, value);
                 }
             } else {
                 var found = false;
-                inline for (var_values, 0..) |value, idx| {
+                inline for (vv, 0..) |value, idx| { // was var_values
                     const name = var_names[idx];
                     if (std.mem.eql(u8, cmd, name)) {
                         debugPrint(name, value);

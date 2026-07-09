@@ -69,9 +69,9 @@ var string_pos: usize = 0;
 var initialized: bool = false;
 
 // Step mode state
-var step_mode: enum { none, step_in, step_over } = .none;
+var step_mode: enum { none, step_in, step_over, step_out } = .none;
 var step_function_hash: u32 = 0; // for step_over: only break in same function
-var step_file_hash: u32 = 0; // for step_over: only break in same file
+var step_file_hash: u32 = 0; // for step_over/step_out: file context
 var last_known_file: []const u8 = "unknown";
 
 // ============================================================================
@@ -94,6 +94,12 @@ pub fn shouldBreak(file_hash: u32, line: u32) bool {
     if (step_mode == .step_over) {
         // Only break if we're in the same file (same function scope)
         if (file_hash == step_file_hash) {
+            return true;
+        }
+    }
+    if (step_mode == .step_out) {
+        // Break when we return to a DIFFERENT file (the caller)
+        if (file_hash != step_file_hash) {
             return true;
         }
     }
@@ -127,13 +133,14 @@ pub fn onBreak(
     const bp_file = file_path;
     last_known_file = bp_file;
 
+    const vv = runtime.rebuild(var_values);
     // Clear step mode — we've landed, user will choose next action
     step_mode = .none;
 
     std.debug.print("[zdb] BREAK: {s}:{} in {s}()\n", .{ bp_file, line, function_name });
 
     // Write state file so nvim can display it
-    writeStateFile(function_name, bp_file, line, var_names, var_values);
+    writeStateFile(function_name, bp_file, line, var_names, vv);
 
     // Clear old output and command
     deleteFile(config.command_file);
@@ -166,9 +173,16 @@ pub fn onBreak(
                 break;
             }
 
+            // Step out: continue until we leave this file
+            if (std.mem.eql(u8, cmd, "out") or std.mem.eql(u8, cmd, "o")) {
+                step_mode = .step_out;
+                step_file_hash = file_hash;
+                break;
+            }
+
             // "v" or "vars" — list all variables with values
             if (std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "vars")) {
-                writeAllVars(var_names, var_values);
+                writeAllVars(var_names, vv);
                 deleteFile(config.command_file);
                 continue;
             }
@@ -181,14 +195,14 @@ pub fn onBreak(
 
             // Try to match a variable name (exact or with .field path)
             var matched = false;
-            const fields = @typeInfo(@TypeOf(var_values)).@"struct".fields;
+            const fields = @typeInfo(@TypeOf(vv)).@"struct".fields;
             inline for (fields, 0..) |_, i| {
                 if (i < var_names.len) {
                     const name = var_names[i];
 
                     // Exact match
                     if (std.mem.eql(u8, query, name)) {
-                        writeVarDetail(name, var_values[i]);
+                        writeVarDetail(name, vv[i]);
                         matched = true;
                     }
 
@@ -201,7 +215,7 @@ pub fn onBreak(
                             query[name.len + 1 ..]
                         else
                             query[name.len..]; // include the [
-                        writeFieldAccess(name, var_values[i], path, 3);
+                        writeFieldAccess(name, vv[i], path, 3);
                         matched = true;
                     }
                 }
@@ -229,13 +243,11 @@ fn init() void {
     initialized = true;
     string_pos = 0;
 
-    // Check for ZDB env vars
-    // ZDB_MODE=dap|terminal|silent
-    // ZDB_BREAKPOINTS=/path/to/file.zon
-    // ZDB_PAUSE_ON_START=1
-
     // Try to load breakpoint file
     reloadBreakpoints();
+
+    // Clear stale state from previous run
+    writeRunningState();
 }
 
 // ============================================================================
@@ -243,11 +255,9 @@ fn init() void {
 // ============================================================================
 
 fn pollForChanges() void {
-    // Throttle checks via call counter
     poll_counter +%= 1;
     if (poll_counter % POLL_EVERY_N != 0) return;
 
-    // Stat the file — check mtime
     const io_local = runtime.runtime.io();
     const cwd = std.Io.Dir.cwd();
     const stat = cwd.statFile(io_local, config.breakpoint_file, .{}) catch return;
@@ -273,7 +283,6 @@ fn reloadBreakpoints() void {
     };
     defer io_local.vtable.fileClose(io_local.userdata, &.{file});
 
-    // Read file contents
     var bytes_read: usize = 0;
     while (bytes_read < file_buf.len) {
         const n = io_local.vtable.fileReadPositional(io_local.userdata, file, &.{file_buf[bytes_read..]}, bytes_read) catch break;
@@ -287,42 +296,26 @@ fn reloadBreakpoints() void {
 
 // ============================================================================
 // ZON Parser
-//
-// Parses a simple ZON format for breakpoints:
-//
-//   .{
-//       .breakpoints = .{
-//           .{ .file = "src/main.zig", .line = 106 },
-//           .{ .file = "src/timeline.zig", .line = 42, .enabled = false },
-//       },
-//       .config = .{
-//           .pause_on_start = true,
-//       },
-//   }
-//
-// Uses the Zig tokenizer for robust parsing — no regex, no hacks.
 // ============================================================================
 
 fn parseZonBreakpoints(content: []const u8) void {
     breakpoint_count = 0;
     string_pos = 0;
 
-    // Null-terminate the content for the tokenizer
-    if (content.len >= file_buf.len) return; // safety check
+    if (content.len >= file_buf.len) return;
     file_buf[content.len] = 0;
     const source: [:0]const u8 = file_buf[0..content.len :0];
 
     var tokenizer = std.zig.Tokenizer.init(source);
 
-    // State machine: look for .file = "..." and .line = N patterns
     const State = enum {
-        searching, // looking for .file or .line
-        after_dot_file, // saw .file, expect =
-        after_file_eq, // saw .file =, expect string
-        after_dot_line, // saw .line, expect =
-        after_line_eq, // saw .line =, expect number
-        after_dot_enabled, // saw .enabled, expect =
-        after_enabled_eq, // saw .enabled =, expect bool
+        searching,
+        after_dot_file,
+        after_file_eq,
+        after_dot_line,
+        after_line_eq,
+        after_dot_enabled,
+        after_enabled_eq,
     };
 
     var state: State = .searching;
@@ -337,7 +330,6 @@ fn parseZonBreakpoints(content: []const u8) void {
         switch (state) {
             .searching => {
                 if (tok.tag == .period) {
-                    // Peek at next token
                     const next = tokenizer.next();
                     if (next.tag == .identifier) {
                         const name = source[next.loc.start..next.loc.end];
@@ -350,7 +342,6 @@ fn parseZonBreakpoints(content: []const u8) void {
                         }
                     }
                 }
-                // Detect end of a breakpoint entry (closing brace or comma)
                 if (tok.tag == .r_brace or tok.tag == .comma) {
                     if (current_file != null and current_line != null) {
                         if (breakpoint_count < MAX_BREAKPOINTS) {
@@ -376,7 +367,6 @@ fn parseZonBreakpoints(content: []const u8) void {
             },
             .after_file_eq => {
                 if (tok.tag == .string_literal) {
-                    // Strip quotes
                     const raw = source[tok.loc.start..tok.loc.end];
                     if (raw.len >= 2) {
                         const str = raw[1 .. raw.len - 1];
@@ -449,17 +439,14 @@ fn dupeString(s: []const u8) ?[]const u8 {
     return string_buf[start .. start + s.len];
 }
 
-// Buffer writing helpers (replaces fixedBufferStream which no longer exists)
-
 fn appendSlice(buf: []u8, pos: usize, data: []const u8) usize {
     const end = pos + data.len;
-    if (end > buf.len) return pos; // silent truncate
+    if (end > buf.len) return pos;
     @memcpy(buf[pos..end], data);
     return end;
 }
 
 fn appendInt(buf: []u8, pos: usize, val: u32) usize {
-    // Format u32 into decimal digits
     var tmp: [10]u8 = undefined;
     var n = val;
     var len: usize = 0;
@@ -471,7 +458,6 @@ fn appendInt(buf: []u8, pos: usize, val: u32) usize {
             tmp[len] = @intCast('0' + (n % 10));
             n /= 10;
         }
-        // Reverse
         var i: usize = 0;
         while (i < len / 2) : (i += 1) {
             const t = tmp[i];
@@ -488,8 +474,6 @@ fn appendInt(buf: []u8, pos: usize, val: u32) usize {
 
 pub fn compileFileHash(comptime filename: []const u8) u32 {
     @setEvalBranchQuota(100_000);
-    // Hash just the basename for cross-path matching
-    // (comptime path is absolute, ZON path may be relative)
     const basename = comptime blk: {
         var i = filename.len;
         while (i > 0) {
@@ -511,14 +495,9 @@ fn extractBasename(path: []const u8) []const u8 {
 }
 
 fn fileHashMatches(bp_file: []const u8, hash: u32) bool {
-    // Primary: hash the basename of the breakpoint file path
-    // This matches because compileFileHash also hashes the basename
     const basename = extractBasename(bp_file);
     if (@as(u32, @truncate(std.hash.Fnv1a_32.hash(basename))) == hash) return true;
-
-    // Fallback: exact full-path hash
     if (@as(u32, @truncate(std.hash.Fnv1a_32.hash(bp_file))) == hash) return true;
-
     return false;
 }
 
@@ -531,7 +510,6 @@ fn findBreakpointFile(file_hash: u32, line: u32) ?[]const u8 {
     return null;
 }
 
-/// Find any breakpoint file matching this hash (for step mode, where line won't match)
 fn findFileByHash(file_hash: u32) ?[]const u8 {
     for (breakpoints[0..breakpoint_count]) |bp| {
         if (fileHashMatches(bp.file, file_hash)) {
@@ -543,9 +521,6 @@ fn findFileByHash(file_hash: u32) ?[]const u8 {
 
 // ============================================================================
 // File-based debug communication
-//
-// State file: program writes when stopped (nvim reads to show UI)
-// Command file: nvim writes to tell program what to do (continue/step/quit)
 // ============================================================================
 
 fn writeStateFile(
@@ -556,7 +531,6 @@ fn writeStateFile(
     var_values: anytype,
 ) void {
     @setEvalBranchQuota(200_000);
-    // Build state text manually into state_buf
     var pos: usize = 0;
 
     pos = appendSlice(&state_buf, pos, "status=stopped\nfile=");
@@ -567,7 +541,6 @@ fn writeStateFile(
     pos = appendSlice(&state_buf, pos, function_name);
     pos = appendSlice(&state_buf, pos, "\n---\n");
 
-    // Variables
     const fields = @typeInfo(@TypeOf(var_values)).@"struct".fields;
     inline for (fields, 0..) |_, i| {
         const name = if (i < var_names.len) var_names[i] else "?";
@@ -576,7 +549,6 @@ fn writeStateFile(
         pos = appendSlice(&state_buf, pos, ": ");
         pos = appendSlice(&state_buf, pos, @typeName(@TypeOf(var_values[i])));
         pos = appendSlice(&state_buf, pos, " = ");
-        // Compact summary: depth 1 shows 1 level of struct fields
         pos = formatValue(&state_buf, pos, var_values[i], 1, 1);
         pos = appendSlice(&state_buf, pos, "\n");
     }
@@ -621,7 +593,7 @@ fn writeAllVars(var_names: []const []const u8, var_values: anytype) void {
 }
 
 // ============================================================================
-// Field path access — traverse "field.subfield[N..M]" paths at comptime
+// Field path access
 // ============================================================================
 
 fn writeFieldAccess(name: []const u8, root_value: anytype, path: []const u8, comptime depth: u32) void {
@@ -629,7 +601,6 @@ fn writeFieldAccess(name: []const u8, root_value: anytype, path: []const u8, com
     const T = @TypeOf(root_value);
     const info = @typeInfo(T);
 
-    // 1. Deref single pointers (doesn't consume depth)
     if (comptime info == .pointer and info.pointer.size == .one) {
         const child_info = @typeInfo(info.pointer.child);
         if (comptime child_info == .@"opaque" or child_info == .@"fn") {
@@ -639,7 +610,6 @@ fn writeFieldAccess(name: []const u8, root_value: anytype, path: []const u8, com
         return writeFieldAccess(name, root_value.*, path, depth);
     }
 
-    // 2. Unwrap optionals (doesn't consume depth)
     if (comptime info == .optional) {
         if (root_value) |v| {
             return writeFieldAccess(name, v, path, depth);
@@ -649,44 +619,37 @@ fn writeFieldAccess(name: []const u8, root_value: anytype, path: []const u8, com
         }
     }
 
-    // 3. Bracket access at current level (doesn't need depth)
     if (path.len > 0 and path[0] == '[') {
         showSliceRange(root_value, path);
         return;
     }
 
-    // 4. If no path left, format the value
     if (path.len == 0) {
         writeVarDetail(name, root_value);
         return;
     }
 
-    // 5. Check depth for further struct traversal
     if (depth == 0) {
         writeOutput("Path too deep (max 3 levels)");
         return;
     }
 
-    // 6. Must be a struct for field access
     if (comptime info != .@"struct") {
         writeOutput("Not a struct, cannot access fields");
         return;
     }
 
-    // 7. Guard against huge structs (compile-time explosion)
     if (comptime info.@"struct".fields.len > 20) {
         writeOutput("Struct too large for field access");
         return;
     }
 
-    // 8. Parse field name from path (up to next '.' or '[')
     var field_end: usize = 0;
     while (field_end < path.len and path[field_end] != '.' and path[field_end] != '[') {
         field_end += 1;
     }
     const field_name = path[0..field_end];
 
-    // 9. Comptime field lookup
     var found = false;
     inline for (info.@"struct".fields) |field| {
         if (std.mem.eql(u8, field.name, field_name)) {
@@ -694,13 +657,10 @@ fn writeFieldAccess(name: []const u8, root_value: anytype, path: []const u8, com
             const field_val = @field(root_value, field.name);
 
             if (field_end >= path.len) {
-                // End of path — show full detail
                 writeVarDetail(field_name, field_val);
             } else if (path[field_end] == '.') {
-                // More field traversal
                 writeFieldAccess(name, field_val, path[field_end + 1 ..], depth - 1);
             } else {
-                // '[' — bracket access on this field
                 showSliceRange(field_val, path[field_end..]);
             }
         }
@@ -716,19 +676,14 @@ fn writeFieldAccess(name: []const u8, root_value: anytype, path: []const u8, com
     }
 }
 
-/// Parse "[N]" or "[N..M]" from a bracket expression string.
-/// Returns start index and optional end index.
 fn parseBracketRange(expr: []const u8) struct { start: usize, end: ?usize } {
-    // Skip leading [
     var i: usize = if (expr.len > 0 and expr[0] == '[') 1 else 0;
 
-    // Parse start number
     var start: usize = 0;
     while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') : (i += 1) {
         start = start * 10 + @as(usize, expr[i] - '0');
     }
 
-    // Check for ..
     if (i + 1 < expr.len and expr[i] == '.' and expr[i + 1] == '.') {
         i += 2;
         var end_val: usize = 0;
@@ -738,16 +693,13 @@ fn parseBracketRange(expr: []const u8) struct { start: usize, end: ?usize } {
         return .{ .start = start, .end = end_val };
     }
 
-    // Single index [N] — show just that element
     return .{ .start = start, .end = null };
 }
 
-/// Show slice/array elements for a bracket range expression like "[1..4]" or "[0]"
 fn showSliceRange(value: anytype, bracket_expr: []const u8) void {
     const T = @TypeOf(value);
     const info = @typeInfo(T);
 
-    // Deref pointers
     if (comptime info == .pointer and info.pointer.size == .one) {
         if (comptime @typeInfo(info.pointer.child) == .@"opaque" or @typeInfo(info.pointer.child) == .@"fn") {
             writeOutput("Cannot index opaque/fn pointer");
@@ -756,7 +708,6 @@ fn showSliceRange(value: anytype, bracket_expr: []const u8) void {
         return showSliceRange(value.*, bracket_expr);
     }
 
-    // Handle slices
     if (comptime info == .pointer and info.pointer.size == .slice) {
         const range = parseBracketRange(bracket_expr);
 
@@ -766,7 +717,6 @@ fn showSliceRange(value: anytype, bracket_expr: []const u8) void {
         }
 
         if (range.end) |end_req| {
-            // Range [N..M]
             const end = @min(end_req, value.len);
             var pos: usize = 0;
             pos = appendSlice(&output_buf, pos, "[");
@@ -789,7 +739,6 @@ fn showSliceRange(value: anytype, bracket_expr: []const u8) void {
             }
             writeFileToCwd(config.output_file, output_buf[0..pos]);
         } else {
-            // Single index [N]
             var pos: usize = 0;
             pos = appendSlice(&output_buf, pos, "[");
             pos = appendInt(&output_buf, pos, @intCast(range.start));
@@ -800,7 +749,6 @@ fn showSliceRange(value: anytype, bracket_expr: []const u8) void {
         return;
     }
 
-    // Handle arrays (coerce to slice)
     if (comptime info == .array) {
         const slice: []const info.array.child = &value;
         return showSliceRange(slice, bracket_expr);
@@ -809,10 +757,6 @@ fn showSliceRange(value: anytype, bracket_expr: []const u8) void {
     writeOutput("Cannot index: not a slice or array");
 }
 
-/// Get a clean short type name. Handles generics properly:
-///   std.array_list.ArrayListAligned(Animation.Frame,null) → ArrayList(Frame)
-///   timeline.AnimationTimeline → AnimationTimeline
-///   usize → usize
 fn shortTypeName(comptime T: type) []const u8 {
     const full = @typeName(T);
     const paren = comptime std.mem.indexOfScalar(u8, full, '(') orelse full.len;
@@ -830,7 +774,6 @@ fn formatValue(buf: []u8, start: usize, value: anytype, comptime max_depth: u32,
     const info = @typeInfo(T);
     var pos = start;
 
-    // Primitives ALWAYS show values regardless of depth
     switch (info) {
         .int => {
             var tmp: [24]u8 = undefined;
@@ -851,7 +794,6 @@ fn formatValue(buf: []u8, start: usize, value: anytype, comptime max_depth: u32,
         else => {},
     }
 
-    // For containers, stop at depth limit
     if (max_depth == 0) {
         pos = appendSlice(buf, pos, shortTypeName(T));
         return pos;
@@ -867,7 +809,6 @@ fn formatValue(buf: []u8, start: usize, value: anytype, comptime max_depth: u32,
         },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
-                // String — truncate at 120 chars
                 pos = appendSlice(buf, pos, "\"");
                 const str = if (value.len > 120) value[0..120] else value;
                 pos = appendSlice(buf, pos, str);
@@ -1006,7 +947,6 @@ fn readCommandFile() ?[]const u8 {
 
     if (bytes_read == 0) return null;
 
-    // Trim whitespace/newlines
     var end = bytes_read;
     while (end > 0 and (cmd_buf[end - 1] == '\n' or cmd_buf[end - 1] == '\r' or cmd_buf[end - 1] == ' ')) {
         end -= 1;
@@ -1026,7 +966,6 @@ fn writeFileToCwd(path: []const u8, content: []const u8) void {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.createFile(io_local, path, .{}) catch return;
     defer io_local.vtable.fileClose(io_local.userdata, &.{file});
-    // data slice must have >= 1 element (impl does data[0..data.len-1])
     const iov = [1][]const u8{content};
     _ = io_local.vtable.fileWritePositional(io_local.userdata, file, &.{}, &iov, 1, 0) catch {};
 }
@@ -1042,13 +981,11 @@ fn dapSendStopped(
     var_names: []const []const u8,
     var_values: anytype,
 ) void {
-    // DAP "stopped" event — implemented in dap.zig
     _ = function_name;
     _ = file_hash;
     _ = line;
     _ = var_names;
     _ = var_values;
-    // TODO: call into dap module
 }
 
 fn logBreakpoint(function_name: []const u8, file_hash: u32, line: u32) void {
@@ -1061,12 +998,10 @@ fn logBreakpoint(function_name: []const u8, file_hash: u32, line: u32) void {
 // Public helpers for generated code
 // ============================================================================
 
-/// Write the initial ZON file with no breakpoints (creates the file for editors)
 pub fn ensureBreakpointFile() void {
     const io_local = runtime.runtime.io();
     const cwd = std.Io.Dir.cwd();
 
-    // Only create if it doesn't exist
     cwd.access(io_local, config.breakpoint_file, .{}) catch {
         const file = cwd.createFile(io_local, config.breakpoint_file, .{}) catch return;
         defer io_local.vtable.fileClose(io_local.userdata, &.{file});
@@ -1090,14 +1025,11 @@ pub fn ensureBreakpointFile() void {
     };
 }
 
-/// Get current breakpoint list (for DAP responses)
 pub fn getBreakpoints() []const Breakpoint {
     return breakpoints[0..breakpoint_count];
 }
 
-/// Programmatic breakpoint add (from DAP setBreakpoints)
 pub fn setBreakpointsForFile(file: []const u8, lines: []const u32) void {
-    // Remove existing breakpoints for this file
     var write_idx: usize = 0;
     for (breakpoints[0..breakpoint_count]) |bp| {
         if (!std.mem.eql(u8, bp.file, file)) {
@@ -1107,7 +1039,6 @@ pub fn setBreakpointsForFile(file: []const u8, lines: []const u32) void {
     }
     breakpoint_count = write_idx;
 
-    // Add new ones
     for (lines) |line| {
         if (breakpoint_count < MAX_BREAKPOINTS) {
             breakpoints[breakpoint_count] = .{
@@ -1119,7 +1050,6 @@ pub fn setBreakpointsForFile(file: []const u8, lines: []const u32) void {
         }
     }
 
-    // Write back to ZON file so other tools see it
     writeBreakpointFile();
 }
 

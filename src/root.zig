@@ -13,6 +13,7 @@ pub const handleBreakpoint = runtime.handleBreakpoint;
 pub const handleStepBefore = runtime.handleStepBefore;
 pub const handleStep = runtime.handleStep;
 
+pub const canAddress = runtime.canAddress;
 pub const addWatch = runtime.addWatch;
 pub const checkWatches = runtime.checkWatches;
 
@@ -48,7 +49,7 @@ pub fn addTo(
         .environ = std.process.Environ.empty,
     });
     defer threaded.deinit();
-    const io = threaded.ioBasic();
+    const io = threaded.io();
 
     // Check if build.zig needs preprocessing
     const build_content = std.Io.Dir.cwd().readFileAlloc(io, "build.zig", b.allocator, .limited(10 * 1024 * 1024)) catch "";

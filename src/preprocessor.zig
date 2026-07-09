@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .argv0 = .init(init.args),
     });
     defer threaded.deinit();
-    const io = threaded.ioBasic();
+    const io = threaded.io();
     const args = try init.args.toSlice(allocator);
 
     if (args.len < 3) {
@@ -251,9 +251,12 @@ fn walkFunction(ctx: *WalkContext, fn_node: Node.Index) WalkError!void {
         var it = proto.iterate(ctx.ast);
         while (it.next()) |param| {
             if (param.name_token) |name_tok| {
-                try ctx.vars.append(ctx.allocator, .{
-                    .name = try ctx.allocator.dupe(u8, ctx.ast.tokenSlice(name_tok)),
-                });
+                const pname = ctx.ast.tokenSlice(name_tok);
+                if (!std.mem.eql(u8, pname, "_")) {
+                    try ctx.vars.append(ctx.allocator, .{
+                        .name = try ctx.allocator.dupe(u8, pname),
+                    });
+                }
             }
         }
     }
@@ -646,7 +649,7 @@ fn genStepDebug(ctx: *WalkContext, line_text: []const u8, line_number: usize, in
     try buf.appendSlice(ctx.allocator, "};\n");
     try buf.appendSlice(ctx.allocator, indent);
     try buf.appendSlice(ctx.allocator, "    const var_values = .{");
-    try appendVarValues(&buf, ctx);
+    try appendVarValuesPtr(&buf, ctx);
     try buf.appendSlice(ctx.allocator, "};\n");
     try buf.appendSlice(ctx.allocator, indent);
     try buf.appendSlice(ctx.allocator, "    zdb.handleStepBefore(\"");
@@ -709,6 +712,19 @@ fn appendVarValues(buf: *std.ArrayList(u8), ctx: *WalkContext) !void {
         first = false;
     }
 }
+fn appendVarValuesPtr(buf: *std.ArrayList(u8), ctx: *WalkContext) !void {
+    var first = true;
+    for (ctx.vars.items) |v| {
+        if (!first) try buf.appendSlice(ctx.allocator, ", ");
+        try buf.print(ctx.allocator, "(if (comptime zdb.canAddress(@TypeOf({s}))) &{s} else {s})", .{ v.name, v.name, v.name });
+        first = false;
+    }
+    for (ctx.globals.items) |g| {
+        if (!first) try buf.appendSlice(ctx.allocator, ", ");
+        try buf.print(ctx.allocator, "(if (comptime zdb.canAddress(@TypeOf({s}))) &{s} else {s})", .{ g.name, g.name, g.name });
+        first = false;
+    }
+}
 
 fn appendEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
     for (text) |c| {
@@ -762,6 +778,7 @@ fn getVarDeclName(ast: *const Ast, node: Node.Index) ?[]const u8 {
         const name_tok = decl.ast.mut_token + 1;
         if (name_tok < ast.tokens.len) {
             const name = ast.tokenSlice(name_tok);
+            if (std.mem.eql(u8, name, "_")) return null;
             if (name.len > 0 and (std.ascii.isAlphabetic(name[0]) or name[0] == '_')) {
                 return name;
             }

@@ -62,6 +62,7 @@ var poll_tick: u32 = 0;
 
 /// CALLED BY: every redirect wrapper. Null ⇒ run the local body.
 pub inline fn redirect(id: u64) ?*const anyopaque {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return null;
     if (@inComptime()) return null; // wrappers also run in comptime calls
     if (host_api) |api| return api.redirect(id); // generated code: the host owns the table
     if (!armed.load(.monotonic)) return null;
@@ -581,6 +582,7 @@ var last_stop_function: []const u8 = "";
 /// CALLED BY: live.onBreak, runtime.handleStepBefore and runtime.handleBreakpoint,
 /// host side, once execution is actually paused.
 pub fn onStop(file_path: []const u8, function_name: []const u8, line: usize, locals: []const LocalRef) void {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return;
     const cfg = config() orelse return;
     const file = relative(cfg.source_dir, file_path);
     const here: Stop = .{ .file = file, .function = function_name, .line = line };
@@ -682,6 +684,7 @@ fn run(printer: InspectFn, ref: LocalRef, out: []u8) []const u8 {
 /// (and this path's own level queued behind); covered by a background build → wait
 /// for that one; otherwise build now.
 pub fn inspect(ref: LocalRef, rest: []const u8, out: []u8) []const u8 {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return "generations unavailable on this OS";
     const here = stop orelse return "no stop to inspect from";
     const cfg = configOrReport() orelse return "generations unavailable (start the app with `zig build debug`)";
     if (ref.bytes_len == 0) return "<no runtime bytes>";
@@ -731,7 +734,7 @@ extern "c" fn write(fd: c_int, buf: *const anyopaque, n: usize) isize;
 extern "c" fn read(fd: c_int, buf: *anyopaque, n: usize) isize;
 
 var probe_pipe: ?[2]c_int = null;
-const probe_page = 16 * 1024; // Apple Silicon page size
+const probe_page = 4096; // probe granularity; valid on both supported OSes
 
 /// Every page in [address, address+len) is mapped. write(2) returns EFAULT for an
 /// unmapped source instead of faulting, so a pipe is a crash-free probe.

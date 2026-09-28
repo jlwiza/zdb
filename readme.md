@@ -2,8 +2,8 @@
 
 A lightweight source-level debugger for Zig that works through compile-time preprocessing.
 
-**Requirements:** Zig 0.16. Breakpoints and stepping are plain Zig; hot generations
-(step into anything, on-demand inspection) currently need macOS on Apple Silicon.
+**Requirements:** Zig 0.16. Breakpoints and stepping are plain Zig.
+Generations: macOS arm64 and Linux x86_64.
 
 ## Why ZDB?
 
@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
         .enable_step_mode = true,
         .enable_live_mode = true,
         .discover_breakpoint = true, // the first file with `_ = .breakpoint;`
-        .enable_generations = true, // step into anything; inspect on demand (macOS arm64)
+        .enable_generations = true, // step into anything; inspect on demand (macOS arm64, Linux x86_64)
         // Optional: instrument only selected source-relative paths.
         // .include = &.{"main.zig"},
     });
@@ -207,7 +207,6 @@ You can use `zig build test-debug` to debug the test file in the repo to experim
 - **Memory visualization**: See how your data structures actually layout in memory
 - **Custom formatters**: Define how your types display in the debugger
 - **Remote debugging**: Debug programs running on other machines
-- **Linux support** for generations (an ELF symbol reader)
 
 ## License
 

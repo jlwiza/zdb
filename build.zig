@@ -1,13 +1,21 @@
 const std = @import("std");
 pub const addTo = @import("src/root.zig").addTo;
+pub const addSidecar = @import("src/root.zig").addSidecar;
+pub const addSidecarFromSource = @import("src/root.zig").addSidecarFromSource;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Generation loader: shared by zdb runtime and app script hot reload
+    const gen_module = b.addModule("dylib_generation", .{
+        .root_source_file = b.path("src/generation_loader.zig"),
+    });
+
     // The library module
     const zdb_module = b.addModule("zdb", .{
         .root_source_file = b.path("src/root.zig"),
+        .imports = &.{.{ .name = "dylib_generation", .module = gen_module }},
     });
 
     // The preprocessor tool
@@ -25,17 +33,29 @@ pub fn build(b: *std.Build) void {
     // Install the preprocessor so dependencies can use it
     b.installArtifact(preprocessor);
 
+    const continuation_codegen = b.addExecutable(.{
+        .name = "zdb-continuation-codegen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/continuation_codegen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(continuation_codegen);
+
     // Unit tests
     const lib_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "dylib_generation", .module = gen_module }},
         }),
     });
 
     const test_step = b.step("test", "Run library tests");
-    test_step.dependOn(&lib_tests.step);
+    const run_lib_tests = b.addRunArtifact(lib_tests);
+    test_step.dependOn(&run_lib_tests.step);
 
     // Test executable for development
     const test_exe = b.addExecutable(.{
@@ -47,7 +67,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    _ = .breakpoint;
 
     const test_run = b.addRunArtifact(test_exe);
     const test_run_step = b.step("test-run", "Run test program");
@@ -176,8 +195,7 @@ pub fn build(b: *std.Build) void {
         "zig",          "build",
         "--build-file", "processed/build.zig",
         "--prefix",     "zig-out",
-        "--cache-dir",
-        ".zig-cache",
+        "--cache-dir",  ".zig-cache",
         // Don't run test-debug, just process the build file
     });
     run_debug_build.step.dependOn(&preprocess_build.step);

@@ -1,5 +1,7 @@
 const std = @import("std");
 const runtime = @import("runtime.zig");
+const sidecar_abi = @import("sidecar_abi.zig");
+const gen = @import("gen.zig");
 
 // ============================================================================
 // Live Breakpoint System
@@ -70,17 +72,37 @@ var initialized: bool = false;
 
 // Step mode state
 var step_mode: enum { none, step_in, step_over, step_out } = .none;
-var step_function_hash: u32 = 0; // for step_over: only break in same function
-var step_file_hash: u32 = 0; // for step_over/step_out: file context
+var step_frame: usize = 0; // frame of the stop that started next/out; stacks grow down, so larger = shallower
+var break_frame: usize = 0; // frame of the most recent stop
 var last_known_file: []const u8 = "unknown";
 
 // ============================================================================
 // Public API — called from instrumented code
 // ============================================================================
 
+/// CALLED BY: gen's host redirect — a step-in into a cold function builds it and waits.
+pub fn stepInPending() bool {
+    return step_mode == .step_in;
+}
+
 /// Fast check: should we break at this file:line?
 /// Called at every instrumented statement. Must be fast.
 pub fn shouldBreak(file_hash: u32, line: u32) bool {
+    const frame = @frameAddress(); // same depth relation in host and generation: called straight from the hook
+    if (gen.remote()) |api| return api.shouldBreak(file_hash, line, frame); // generated code: the host owns breakpoints and stepping
+    return breakAt(file_hash, line, frame);
+}
+
+/// CALLED BY: shouldBreak here, or through HostApi from generated code.
+pub fn breakAt(file_hash: u32, line: u32, frame: usize) bool {
+    if (checkBreak(file_hash, line, frame)) {
+        break_frame = frame;
+        return true;
+    }
+    return false;
+}
+
+fn checkBreak(file_hash: u32, line: u32, frame: usize) bool {
     // Lazy init on first call
     if (!initialized) init();
 
@@ -91,18 +113,8 @@ pub fn shouldBreak(file_hash: u32, line: u32) bool {
     if (step_mode == .step_in) {
         return true;
     }
-    if (step_mode == .step_over) {
-        // Only break if we're in the same file (same function scope)
-        if (file_hash == step_file_hash) {
-            return true;
-        }
-    }
-    if (step_mode == .step_out) {
-        // Break when we return to a DIFFERENT file (the caller)
-        if (file_hash != step_file_hash) {
-            return true;
-        }
-    }
+    if (step_mode == .step_over and frame >= step_frame) return true; // same function, or its caller after return
+    if (step_mode == .step_out and frame > step_frame) return true; // strictly shallower: we've returned
 
     // Fast path: no breakpoints set
     if (breakpoint_count == 0) return false;
@@ -119,28 +131,29 @@ pub fn shouldBreak(file_hash: u32, line: u32) bool {
     return false;
 }
 
-/// Called when shouldBreak() returns true — handles the actual break
+/// Called when shouldBreak() returns true — handles the actual break.
+/// Non-generic: every hook in every file passes the same slice type.
 pub fn onBreak(
     function_name: []const u8,
     file_path: []const u8,
     file_hash: u32,
     line: u32,
-    var_names: []const []const u8,
-    var_values: anytype,
+    locals: []const sidecar_abi.LocalRef,
 ) void {
-    @setEvalBranchQuota(500_000);
+    if (gen.remote()) |api| return api.onBreak(function_name, file_path, file_hash, line, locals);
+    if (runtime.beginSidecarHandoff(function_name, locals)) return;
     // Use the file path passed directly from instrumented code
     const bp_file = file_path;
     last_known_file = bp_file;
 
-    const vv = runtime.rebuild(var_values);
     // Clear step mode — we've landed, user will choose next action
     step_mode = .none;
 
     std.debug.print("[zdb] BREAK: {s}:{} in {s}()\n", .{ bp_file, line, function_name });
+    gen.onStop(file_path, function_name, line, locals); // may recenter the ring and queue inspectors in the background
 
     // Write state file so nvim can display it
-    writeStateFile(function_name, bp_file, line, var_names, vv);
+    writeStateFile(function_name, bp_file, line, locals);
 
     // Clear old output and command
     deleteFile(config.command_file);
@@ -158,6 +171,13 @@ pub fn onBreak(
                 step_mode = .none;
                 break;
             }
+            if (std.mem.eql(u8, cmd, "reload") or std.mem.eql(u8, cmd, "r")) {
+                if (runtime.reloadSidecarHandoff(function_name, locals) == .continue_execution) {
+                    step_mode = .none;
+                    break;
+                }
+                continue;
+            }
             if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q")) std.process.exit(0);
 
             // Step in: break on very next statement (any file/function)
@@ -166,23 +186,23 @@ pub fn onBreak(
                 break;
             }
 
-            // Step over: break on next statement in same file only
+            // Step over: next statement at this depth or shallower (calls run through)
             if (std.mem.eql(u8, cmd, "next") or std.mem.eql(u8, cmd, "n")) {
                 step_mode = .step_over;
-                step_file_hash = file_hash;
+                step_frame = break_frame;
                 break;
             }
 
-            // Step out: continue until we leave this file
+            // Step out: first statement after this function returns
             if (std.mem.eql(u8, cmd, "out") or std.mem.eql(u8, cmd, "o")) {
                 step_mode = .step_out;
-                step_file_hash = file_hash;
+                step_frame = break_frame;
                 break;
             }
 
             // "v" or "vars" — list all variables with values
             if (std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "vars")) {
-                writeAllVars(var_names, vv);
+                writeAllVars(locals);
                 deleteFile(config.command_file);
                 continue;
             }
@@ -193,38 +213,7 @@ pub fn onBreak(
             else
                 cmd;
 
-            // Try to match a variable name (exact or with .field path)
-            var matched = false;
-            const fields = @typeInfo(@TypeOf(vv)).@"struct".fields;
-            inline for (fields, 0..) |_, i| {
-                if (i < var_names.len) {
-                    const name = var_names[i];
-
-                    // Exact match
-                    if (std.mem.eql(u8, query, name)) {
-                        writeVarDetail(name, vv[i]);
-                        matched = true;
-                    }
-
-                    // Dot-path or bracket: "varname.field" or "varname[0..5]"
-                    if (!matched and query.len > name.len and
-                        std.mem.eql(u8, query[0..name.len], name) and
-                        (query[name.len] == '.' or query[name.len] == '['))
-                    {
-                        const path = if (query[name.len] == '.')
-                            query[name.len + 1 ..]
-                        else
-                            query[name.len..]; // include the [
-                        writeFieldAccess(name, vv[i], path, 3);
-                        matched = true;
-                    }
-                }
-            }
-
-            if (!matched) {
-                writeOutput("Unknown variable or command. Use 'v' to list variables.");
-            }
-
+            writeLocalQuery(locals, query);
             deleteFile(config.command_file);
         }
     }
@@ -520,6 +509,56 @@ fn findFileByHash(file_hash: u32) ?[]const u8 {
 }
 
 // ============================================================================
+// Locals — type-erased; scalars decode from bytes, everything else waits
+// for on-demand inspection
+// ============================================================================
+
+/// "name: type = value" — value is a decoded scalar, or a size/address summary.
+fn appendLocal(buf: []u8, start: usize, ref: sidecar_abi.LocalRef) usize {
+    const type_name = ref.type_name_ptr[0..ref.type_name_len];
+    var pos = appendSlice(buf, start, ref.name_ptr[0..ref.name_len]);
+    pos = appendSlice(buf, pos, ": ");
+    pos = appendSlice(buf, pos, type_name);
+    pos = appendSlice(buf, pos, " = ");
+    if (ref.bytes_len == 0) return appendSlice(buf, pos, "<no runtime bytes>");
+    var scalar_buf: [64]u8 = undefined;
+    if (runtime.formatScalar(&scalar_buf, type_name, ref.bytes_ptr[0..ref.bytes_len])) |text| {
+        return appendSlice(buf, pos, text);
+    }
+    var summary_buf: [64]u8 = undefined;
+    const summary = std.fmt.bufPrint(&summary_buf, "<{d} bytes @ 0x{x}>", .{ ref.bytes_len, @intFromPtr(ref.bytes_ptr) }) catch "<bytes>";
+    return appendSlice(buf, pos, summary);
+}
+
+/// Scalar local → its line from bytes. Struct, or a path on any local → a
+/// printer compiled on demand for exactly that type and path (cached after).
+fn writeLocalQuery(locals: []const sidecar_abi.LocalRef, query: []const u8) void {
+    for (locals) |ref| {
+        const name = ref.name_ptr[0..ref.name_len];
+        if (!std.mem.startsWith(u8, query, name)) continue;
+        const rest = query[name.len..];
+        if (rest.len > 0 and rest[0] != '.' and rest[0] != '[') continue; // a longer name, not a path
+        if (rest.len == 0) {
+            var scratch: [96]u8 = undefined;
+            const type_name = ref.type_name_ptr[0..ref.type_name_len];
+            const indirect = type_name.len > 0 and (type_name[0] == '*' or type_name[0] == '['); // an address isn't the answer; its target is
+            if (ref.bytes_len == 0 or (!indirect and runtime.formatScalar(&scratch, type_name, ref.bytes_ptr[0..ref.bytes_len]) != null)) {
+                const pos = appendLocal(&output_buf, 0, ref);
+                writeFileToCwd(config.output_file, output_buf[0..pos]);
+                return;
+            }
+        }
+        var pos = appendSlice(&output_buf, 0, query);
+        pos = appendSlice(&output_buf, pos, " = ");
+        const text = gen.inspect(ref, rest, output_buf[pos..]);
+        if (text.ptr != output_buf[pos..].ptr) pos = appendSlice(&output_buf, pos, text) else pos += text.len; // messages aren't in the buffer
+        writeFileToCwd(config.output_file, output_buf[0..pos]);
+        return;
+    }
+    writeOutput("Unknown variable or command. Use 'v' to list variables.");
+}
+
+// ============================================================================
 // File-based debug communication
 // ============================================================================
 
@@ -527,10 +566,8 @@ fn writeStateFile(
     function_name: []const u8,
     bp_file: []const u8,
     line: u32,
-    var_names: []const []const u8,
-    var_values: anytype,
+    locals: []const sidecar_abi.LocalRef,
 ) void {
-    @setEvalBranchQuota(200_000);
     var pos: usize = 0;
 
     pos = appendSlice(&state_buf, pos, "status=stopped\nfile=");
@@ -541,15 +578,9 @@ fn writeStateFile(
     pos = appendSlice(&state_buf, pos, function_name);
     pos = appendSlice(&state_buf, pos, "\n---\n");
 
-    const fields = @typeInfo(@TypeOf(var_values)).@"struct".fields;
-    inline for (fields, 0..) |_, i| {
-        const name = if (i < var_names.len) var_names[i] else "?";
+    for (locals) |ref| {
         pos = appendSlice(&state_buf, pos, "  ");
-        pos = appendSlice(&state_buf, pos, name);
-        pos = appendSlice(&state_buf, pos, ": ");
-        pos = appendSlice(&state_buf, pos, @typeName(@TypeOf(var_values[i])));
-        pos = appendSlice(&state_buf, pos, " = ");
-        pos = formatValue(&state_buf, pos, var_values[i], 1, 1);
+        pos = appendLocal(&state_buf, pos, ref);
         pos = appendSlice(&state_buf, pos, "\n");
     }
 
@@ -564,366 +595,15 @@ fn writeOutput(msg: []const u8) void {
     writeFileToCwd(config.output_file, msg);
 }
 
-fn writeVarDetail(name: []const u8, value: anytype) void {
-    var pos: usize = 0;
-    pos = appendSlice(&output_buf, pos, name);
-    pos = appendSlice(&output_buf, pos, ": ");
-    pos = appendSlice(&output_buf, pos, @typeName(@TypeOf(value)));
-    pos = appendSlice(&output_buf, pos, "\n");
-    pos = formatValue(&output_buf, pos, value, 3, 0);
-    writeFileToCwd(config.output_file, output_buf[0..pos]);
-}
-
-fn writeAllVars(var_names: []const []const u8, var_values: anytype) void {
+fn writeAllVars(locals: []const sidecar_abi.LocalRef) void {
     var pos: usize = 0;
     pos = appendSlice(&output_buf, pos, "=== Variables ===\n");
-    const fields = @typeInfo(@TypeOf(var_values)).@"struct".fields;
-    inline for (fields, 0..) |_, i| {
-        const name = if (i < var_names.len) var_names[i] else "?";
+    for (locals) |ref| {
         pos = appendSlice(&output_buf, pos, "  ");
-        pos = appendSlice(&output_buf, pos, name);
-        pos = appendSlice(&output_buf, pos, " = ");
-        pos = formatValue(&output_buf, pos, var_values[i], 1, 1);
-        if (pos < output_buf.len) {
-            output_buf[pos] = '\n';
-            pos += 1;
-        }
+        pos = appendLocal(&output_buf, pos, ref);
+        pos = appendSlice(&output_buf, pos, "\n");
     }
     writeFileToCwd(config.output_file, output_buf[0..pos]);
-}
-
-// ============================================================================
-// Field path access
-// ============================================================================
-
-fn writeFieldAccess(name: []const u8, root_value: anytype, path: []const u8, comptime depth: u32) void {
-    @setEvalBranchQuota(200_000);
-    const T = @TypeOf(root_value);
-    const info = @typeInfo(T);
-
-    if (comptime info == .pointer and info.pointer.size == .one) {
-        const child_info = @typeInfo(info.pointer.child);
-        if (comptime child_info == .@"opaque" or child_info == .@"fn") {
-            writeOutput("Cannot inspect opaque/fn pointer fields");
-            return;
-        }
-        return writeFieldAccess(name, root_value.*, path, depth);
-    }
-
-    if (comptime info == .optional) {
-        if (root_value) |v| {
-            return writeFieldAccess(name, v, path, depth);
-        } else {
-            writeOutput("Value is null");
-            return;
-        }
-    }
-
-    if (path.len > 0 and path[0] == '[') {
-        showSliceRange(root_value, path);
-        return;
-    }
-
-    if (path.len == 0) {
-        writeVarDetail(name, root_value);
-        return;
-    }
-
-    if (depth == 0) {
-        writeOutput("Path too deep (max 3 levels)");
-        return;
-    }
-
-    if (comptime info != .@"struct") {
-        writeOutput("Not a struct, cannot access fields");
-        return;
-    }
-
-    if (comptime info.@"struct".fields.len > 20) {
-        writeOutput("Struct too large for field access");
-        return;
-    }
-
-    var field_end: usize = 0;
-    while (field_end < path.len and path[field_end] != '.' and path[field_end] != '[') {
-        field_end += 1;
-    }
-    const field_name = path[0..field_end];
-
-    var found = false;
-    inline for (info.@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, field_name)) {
-            found = true;
-            const field_val = @field(root_value, field.name);
-
-            if (field_end >= path.len) {
-                writeVarDetail(field_name, field_val);
-            } else if (path[field_end] == '.') {
-                writeFieldAccess(name, field_val, path[field_end + 1 ..], depth - 1);
-            } else {
-                showSliceRange(field_val, path[field_end..]);
-            }
-        }
-    }
-
-    if (!found) {
-        var p: usize = 0;
-        p = appendSlice(&output_buf, p, "No field '");
-        p = appendSlice(&output_buf, p, field_name);
-        p = appendSlice(&output_buf, p, "' on ");
-        p = appendSlice(&output_buf, p, shortTypeName(T));
-        writeFileToCwd(config.output_file, output_buf[0..p]);
-    }
-}
-
-fn parseBracketRange(expr: []const u8) struct { start: usize, end: ?usize } {
-    var i: usize = if (expr.len > 0 and expr[0] == '[') 1 else 0;
-
-    var start: usize = 0;
-    while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') : (i += 1) {
-        start = start * 10 + @as(usize, expr[i] - '0');
-    }
-
-    if (i + 1 < expr.len and expr[i] == '.' and expr[i + 1] == '.') {
-        i += 2;
-        var end_val: usize = 0;
-        while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') : (i += 1) {
-            end_val = end_val * 10 + @as(usize, expr[i] - '0');
-        }
-        return .{ .start = start, .end = end_val };
-    }
-
-    return .{ .start = start, .end = null };
-}
-
-fn showSliceRange(value: anytype, bracket_expr: []const u8) void {
-    const T = @TypeOf(value);
-    const info = @typeInfo(T);
-
-    if (comptime info == .pointer and info.pointer.size == .one) {
-        if (comptime @typeInfo(info.pointer.child) == .@"opaque" or @typeInfo(info.pointer.child) == .@"fn") {
-            writeOutput("Cannot index opaque/fn pointer");
-            return;
-        }
-        return showSliceRange(value.*, bracket_expr);
-    }
-
-    if (comptime info == .pointer and info.pointer.size == .slice) {
-        const range = parseBracketRange(bracket_expr);
-
-        if (range.start >= value.len) {
-            writeOutput("Index out of bounds");
-            return;
-        }
-
-        if (range.end) |end_req| {
-            const end = @min(end_req, value.len);
-            var pos: usize = 0;
-            pos = appendSlice(&output_buf, pos, "[");
-            pos = appendInt(&output_buf, pos, @intCast(range.start));
-            pos = appendSlice(&output_buf, pos, "..");
-            pos = appendInt(&output_buf, pos, @intCast(end));
-            pos = appendSlice(&output_buf, pos, "] (");
-            pos = appendInt(&output_buf, pos, @intCast(end - range.start));
-            pos = appendSlice(&output_buf, pos, " items)\n");
-
-            var idx = range.start;
-            for (value[range.start..end]) |item| {
-                pos = appendIndent(&output_buf, pos, 1);
-                pos = appendSlice(&output_buf, pos, "[");
-                pos = appendInt(&output_buf, pos, @intCast(idx));
-                pos = appendSlice(&output_buf, pos, "] ");
-                pos = formatValue(&output_buf, pos, item, 2, 1);
-                pos = appendSlice(&output_buf, pos, "\n");
-                idx += 1;
-            }
-            writeFileToCwd(config.output_file, output_buf[0..pos]);
-        } else {
-            var pos: usize = 0;
-            pos = appendSlice(&output_buf, pos, "[");
-            pos = appendInt(&output_buf, pos, @intCast(range.start));
-            pos = appendSlice(&output_buf, pos, "]\n");
-            pos = formatValue(&output_buf, pos, value[range.start], 3, 0);
-            writeFileToCwd(config.output_file, output_buf[0..pos]);
-        }
-        return;
-    }
-
-    if (comptime info == .array) {
-        const slice: []const info.array.child = &value;
-        return showSliceRange(slice, bracket_expr);
-    }
-
-    writeOutput("Cannot index: not a slice or array");
-}
-
-fn shortTypeName(comptime T: type) []const u8 {
-    const full = @typeName(T);
-    const paren = comptime std.mem.indexOfScalar(u8, full, '(') orelse full.len;
-    const base = full[0..paren];
-    const last_dot = comptime std.mem.lastIndexOfScalar(u8, base, '.');
-    if (last_dot) |dot| {
-        return full[dot + 1 ..];
-    }
-    return full;
-}
-
-fn formatValue(buf: []u8, start: usize, value: anytype, comptime max_depth: u32, indent: usize) usize {
-    @setEvalBranchQuota(200_000);
-    const T = @TypeOf(value);
-    const info = @typeInfo(T);
-    var pos = start;
-
-    switch (info) {
-        .int => {
-            var tmp: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{}", .{value}) catch "?";
-            return appendSlice(buf, pos, s);
-        },
-        .float => {
-            var tmp: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d:.4}", .{value}) catch "?";
-            return appendSlice(buf, pos, s);
-        },
-        .bool => return appendSlice(buf, pos, if (value) "true" else "false"),
-        .@"enum" => {
-            pos = appendSlice(buf, pos, ".");
-            return appendSlice(buf, pos, @tagName(value));
-        },
-        .@"fn" => return appendSlice(buf, pos, "<fn>"),
-        else => {},
-    }
-
-    if (max_depth == 0) {
-        pos = appendSlice(buf, pos, shortTypeName(T));
-        return pos;
-    }
-
-    switch (info) {
-        .optional => {
-            if (value) |v| {
-                pos = formatValue(buf, pos, v, max_depth, indent);
-            } else {
-                pos = appendSlice(buf, pos, "null");
-            }
-        },
-        .pointer => |ptr| {
-            if (ptr.size == .slice and ptr.child == u8) {
-                pos = appendSlice(buf, pos, "\"");
-                const str = if (value.len > 120) value[0..120] else value;
-                pos = appendSlice(buf, pos, str);
-                if (value.len > 120) {
-                    pos = appendSlice(buf, pos, "...(");
-                    pos = appendInt(buf, pos, @intCast(value.len));
-                    pos = appendSlice(buf, pos, " bytes)");
-                }
-                pos = appendSlice(buf, pos, "\"");
-            } else if (ptr.size == .slice) {
-                pos = appendSlice(buf, pos, "[](");
-                pos = appendInt(buf, pos, @intCast(value.len));
-                pos = appendSlice(buf, pos, " items)\n");
-                const show = if (value.len > 20) @as(usize, 20) else value.len;
-                for (value[0..show], 0..) |item, idx| {
-                    pos = appendIndent(buf, pos, indent + 1);
-                    pos = appendSlice(buf, pos, "[");
-                    pos = appendInt(buf, pos, @intCast(idx));
-                    pos = appendSlice(buf, pos, "] ");
-                    pos = formatValue(buf, pos, item, max_depth - 1, indent + 1);
-                    pos = appendSlice(buf, pos, "\n");
-                }
-                if (value.len > 20) {
-                    pos = appendIndent(buf, pos, indent + 1);
-                    pos = appendSlice(buf, pos, "... (");
-                    pos = appendInt(buf, pos, @intCast(value.len));
-                    pos = appendSlice(buf, pos, " items total)\n");
-                }
-                pos = appendIndent(buf, pos, indent);
-                pos = appendSlice(buf, pos, "]");
-            } else if (ptr.size == .one) {
-                const child_info = @typeInfo(ptr.child);
-                if (child_info == .@"opaque" or child_info == .@"fn") {
-                    pos = appendSlice(buf, pos, shortTypeName(ptr.child));
-                } else {
-                    pos = formatValue(buf, pos, value.*, max_depth - 1, indent);
-                }
-            } else {
-                pos = appendSlice(buf, pos, "ptr");
-            }
-        },
-        .array => |arr| {
-            if (arr.child == u8) {
-                pos = appendSlice(buf, pos, "\"");
-                const str: []const u8 = &value;
-                const show_str = if (str.len > 120) str[0..120] else str;
-                pos = appendSlice(buf, pos, show_str);
-                if (str.len > 120) {
-                    pos = appendSlice(buf, pos, "...(");
-                    pos = appendInt(buf, pos, @intCast(str.len));
-                    pos = appendSlice(buf, pos, " bytes)");
-                }
-                pos = appendSlice(buf, pos, "\"");
-            } else {
-                const items: []const arr.child = &value;
-                pos = appendSlice(buf, pos, "[](");
-                pos = appendInt(buf, pos, @intCast(items.len));
-                pos = appendSlice(buf, pos, " items)\n");
-                const show = if (items.len > 20) @as(usize, 20) else items.len;
-                for (items[0..show], 0..) |item, idx| {
-                    pos = appendIndent(buf, pos, indent + 1);
-                    pos = appendSlice(buf, pos, "[");
-                    pos = appendInt(buf, pos, @intCast(idx));
-                    pos = appendSlice(buf, pos, "] ");
-                    pos = formatValue(buf, pos, item, max_depth - 1, indent + 1);
-                    pos = appendSlice(buf, pos, "\n");
-                }
-                if (items.len > 20) {
-                    pos = appendIndent(buf, pos, indent + 1);
-                    pos = appendSlice(buf, pos, "... (");
-                    pos = appendInt(buf, pos, @intCast(items.len));
-                    pos = appendSlice(buf, pos, " items total)\n");
-                }
-                pos = appendIndent(buf, pos, indent);
-                pos = appendSlice(buf, pos, "]");
-            }
-        },
-        .@"struct" => |s| {
-            const short = shortTypeName(T);
-            if (s.fields.len == 0) {
-                pos = appendSlice(buf, pos, "{}");
-            } else if (s.fields.len > 16) {
-                pos = appendSlice(buf, pos, short);
-                pos = appendSlice(buf, pos, "{ ... }");
-            } else {
-                pos = appendSlice(buf, pos, short);
-                pos = appendSlice(buf, pos, "{\n");
-                inline for (s.fields) |field| {
-                    pos = appendIndent(buf, pos, indent + 1);
-                    pos = appendSlice(buf, pos, ".");
-                    pos = appendSlice(buf, pos, field.name);
-                    pos = appendSlice(buf, pos, " = ");
-                    pos = formatValue(buf, pos, @field(value, field.name), max_depth - 1, indent + 1);
-                    pos = appendSlice(buf, pos, "\n");
-                }
-                pos = appendIndent(buf, pos, indent);
-                pos = appendSlice(buf, pos, "}");
-            }
-        },
-        else => {
-            var tmp: [128]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{any}", .{value}) catch "?";
-            pos = appendSlice(buf, pos, s);
-        },
-    }
-    return pos;
-}
-
-fn appendIndent(buf: []u8, pos: usize, depth: usize) usize {
-    var p = pos;
-    var i: usize = 0;
-    while (i < depth * 2) : (i += 1) {
-        p = appendSlice(buf, p, " ");
-    }
-    return p;
 }
 
 fn readCommandFile() ?[]const u8 {
@@ -978,14 +658,12 @@ fn dapSendStopped(
     function_name: []const u8,
     file_hash: u32,
     line: u32,
-    var_names: []const []const u8,
-    var_values: anytype,
+    locals: []const sidecar_abi.LocalRef,
 ) void {
     _ = function_name;
     _ = file_hash;
     _ = line;
-    _ = var_names;
-    _ = var_values;
+    _ = locals;
 }
 
 fn logBreakpoint(function_name: []const u8, file_hash: u32, line: u32) void {

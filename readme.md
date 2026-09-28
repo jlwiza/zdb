@@ -42,27 +42,65 @@ const zdb = @import("zdb");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const exe = makeExecutable(b, "my-app", target, optimize);
+    b.installArtifact(exe);
+    const debug_exe = makeExecutable(b, "my-app-debug", target, optimize);
+    zdb.addTo(b, debug_exe, .{
+        .enable_live_mode = true,
+        .discover_breakpoint = true,
+        // Optional: instrument only selected source-relative paths.
+        // Leave empty to instrument the complete source tree.
+        .include = &.{"main.zig"},
+    });
+}
 
-    const exe = b.addExecutable(.{
-        .name = "my-app",
+fn makeExecutable(b: *std.Build, name: []const u8,
+    target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    // Step 2: Add ZDB module to your executable
-    const zdb_dep = b.dependency("zdb", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.root_module.addImport("zdb", zdb_dep.module("zdb"));
-    
-    // Step 3: Add debug command from that support
-    zdb.addTo(b, exe, .{});
-
-    b.installArtifact(exe);
+    // Add all application imports, native sources and link settings here.
+    return b.addExecutable(.{ .name = name, .root_module = mod });
 }
 ```
+
+`addTo` instruments the supplied dedicated executable in place, after its
+configuration is complete. Give it its own root module; do not pass the normal
+executable. Source files and adjacent assets are staged in the build cache.
+`zig build debug-check` compiles and links without launching the application.
+Build-script instrumentation remains a separate `debug-build` tool.
+
+When a selected file contains `_ = .breakpoint;`, step and live hooks are
+injected only from that marker onward in its function. Other functions in that
+file stay ordinary code unless they contain their own marker. Marker-free files
+retain whole-function instrumentation for external live breakpoints. For large
+applications, use `include` to target the file or directory under investigation.
+An empty `include` list retains whole-tree source selection.
+With `discover_breakpoint = true`, the lexicographically first source file
+containing a breakpoint marker is selected automatically. An explicit build
+option can still provide an exact `include` selection.
+
+### Reloadable debugger sidecar
+
+Consumers may set `enable_sidecar = true` in `zdb.addTo`. The debug run then
+loads a versioned dynamic library at the first breakpoint. Enter `r` while
+paused to close it, snapshot the newly built file under a unique name, load it,
+check its ABI version, and call its pause handler. Rebuild the installed file
+with `zig build debug-sidecar -Dzdb-sidecar-generation=<n>`.
+
+The preprocessor builds the initial handoff frame directly from lexical scope.
+Parameters and `const` locals are stable copies; lexical `var` locals are mutable
+pointers. The versioned ABI describes each name, Zig type name, storage kind,
+address and size. `continue_execution` is honored; failure and function-return
+outcomes leave the host paused because this boundary cannot perform them safely.
+
+The instrumented executable still owns post-marker Zig control flow. This does
+not yet transform arbitrary statements into a dylib continuation, edit arbitrary
+types, or make step-into reloadable. Those require generated continuation entry
+points and stricter layout/lifetime validation on top of this frame ABI.
 
 ## Usage
 
@@ -79,6 +117,8 @@ pub fn main() !void {
     processData(&x, name);
 }
 ```
+
+The marker is case-sensitive: spell it `.breakpoint`.
 
 Run with debugging:
 

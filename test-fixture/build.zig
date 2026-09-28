@@ -90,8 +90,17 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("zdb", zdb_dep.module("zdb"));
 
-    // Create the "debug" step that instruments sources
-    zdb.addTo(b, exe, .{});
+    // Instrument a separate, completely configured executable.
+    const debug_exe = b.addExecutable(.{
+        .name = "test_fixture-debug",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "test_fixture", .module = mod } },
+        }),
+    });
+    zdb.addTo(b, debug_exe, .{});
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default

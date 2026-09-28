@@ -28,3 +28,5 @@ Thumbs.db
 core
 *.core
 vgcore.*
+zig-out/
+.zig-cache/

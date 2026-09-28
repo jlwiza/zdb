@@ -153,7 +153,34 @@ ZDB works by preprocessing your Zig source code before compilation. When you run
 4. Runs your program with interactive debugging enabled
 
 The preprocessor understands Zig's syntax well enough to track variable scopes, handle imports, and maintain correct behavior while adding debugging capabilities.
+### Neovim (optional)
 
+The plugin lives in `lua/zdb.lua`; with lazy.nvim:
+
+```lua
+{ 'jlwiza/zdb', config = function() require('zdb').setup() end }
+```
+
+Options: `gutter_click = true` toggles breakpoints by clicking a .zig gutter (off by
+default — it maps `<LeftMouse>` globally). `keys = { next = '<F10>', ... }` remaps,
+`keys = { quit = false }` skips one, `keys = false` maps none. `:Zdb` opens the panel.
+
+## How it talks
+
+The app and any front end share four files in the project root: `zdb_breakpoints.zon`
+(breakpoints, written by the editor, polled by the app), `zdb_state.txt` (stop
+location + locals, written by the app), `zdb_command.txt` (one command per write:
+`continue`, `step`, `next`, `out`, `quit`, or an inspect path like `self.frames[3]`),
+and `zdb_output.txt` (the answer). Any editor can drive zdb through these files.
+
+## Limits
+
+- Only code in the executable's own source tree is instrumented; files in other
+  Zig modules (e.g. a library module your main imports) run uninstrumented, and
+  their globals are duplicated inside generations.
+- Functions with `comptime`/`anytype` params can't be stepped into through a generation.
+- Step state is global: other threads running instrumented code can trip a step.
+- An error crossing a generation as `anyerror` can't be translated and panics with a message.
 ## Contributing
 
 This is an experimental project and I welcome ideas, bug reports, and contributions. The codebase is intentionally small and hackable. If you've ever been frustrated by debuggers and have ideas for improvement, this is a good place to experiment.

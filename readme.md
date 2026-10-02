@@ -81,7 +81,7 @@ marker onward in its function; other functions stay ordinary code. With
 a marker is selected automatically. `include` targets a file or directory explicitly.
 
 ## Usage
-
+Please take care using this, and keep in mind this is an experimental side project, to scratch a curiousity and alievate a frustration. There is not much maintaining I'm doing on this.
 Add a breakpoint:
 
 ```zig

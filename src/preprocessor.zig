@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
 
     // Parse AST
-    const source_z = try allocator.dupeZ(u8, source);
+    const source_z = try allocator.dupeSentinel(u8, source, 0);
     var ast = try Ast.parse(allocator, source_z, .zig);
     defer ast.deinit(allocator);
 
@@ -1055,7 +1055,7 @@ fn importedGlobals(ctx: *WalkContext, import_path: []const u8) ![]const []const 
         std.debug.print("[zdb] couldn't read {s}; `alias.global` uses of it keep the generation's copy (NOT shared)\n", .{full_path});
         return &.{};
     };
-    const ast = try Ast.parse(ctx.allocator, try ctx.allocator.dupeZ(u8, source), .zig);
+    const ast = try Ast.parse(ctx.allocator, try ctx.allocator.dupeSentinel(u8, source,0 ), .zig);
     var names: std.ArrayList([]const u8) = .empty;
     for (ast.rootDecls()) |decl| {
         if (!isSharedGlobal(&ast, decl)) continue;

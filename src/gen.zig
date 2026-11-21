@@ -355,7 +355,7 @@ fn buildIndex(cfg: Config) !Index {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
         if (isExcluded(cfg.exclude, entry.path)) continue;
         const source = dir.readFileAlloc(io, entry.path, gpa, .limited(10 * 1024 * 1024)) catch continue;
-        const source_z = try gpa.dupeZ(u8, source);
+        const source_z = try gpa.dupeSentinel(u8, source, 0);
         const file = try gpa.dupe(u8, entry.path); // walker reuses its path buffer
         try functions.appendSlice(gpa, try fn_index.indexFile(gpa, file, source_z));
     }

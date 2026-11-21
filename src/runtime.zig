@@ -181,7 +181,7 @@ pub fn localRef(name: []const u8, ptr: anytype) sidecar_abi.LocalRef {
         .name_len = name.len,
         .type_name_ptr = type_name.ptr,
         .type_name_len = type_name.len,
-        .storage = if (pointer.is_const) .read_only_pointer else .mutable_pointer, // const local ⇒ &x is *const T
+        .storage = if (pointer.attrs.@"const") .read_only_pointer else .mutable_pointer, // const local ⇒ &x is *const T
         .bytes_ptr = @ptrCast(@constCast(ptr)),
         .bytes_len = @sizeOf(T),
     };

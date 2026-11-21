@@ -87,7 +87,8 @@ pub fn build(b: *std.Build) void {
     };
 
     // When running from processed build, adjust paths
-    const is_processed = std.mem.indexOf(u8, b.build_root.path orelse ".", "processed") != null;
+	const build_root_path = b.root.toString(b.allocator) catch @panic("Failed reading build root");
+	const is_processed = std.mem.indexOf(u8, build_root_path, "processed") != null;
     const base_path = if (is_processed) ".." else ".";
 
     // Preprocess all test files

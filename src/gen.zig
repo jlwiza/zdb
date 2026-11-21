@@ -548,8 +548,8 @@ fn loadGeneration(cfg: Config, serial: u32, kind: LoadKind, wants: []const Want)
         .inspect => for (wants, 0..) |want, slot| { // slot i ⇒ zdb_inspect_i / zdb_level_i
             var print_buf: [32]u8 = undefined;
             var level_buf: [32]u8 = undefined;
-            const print_name = std.fmt.bufPrintZ(&print_buf, "zdb_inspect_{d}", .{slot}) catch continue;
-            const level_name = std.fmt.bufPrintZ(&level_buf, "zdb_level_{d}", .{slot}) catch continue;
+            const print_name = std.fmt.bufPrintSentinel(&print_buf, "zdb_inspect_{d}", .{slot}, 0) catch continue;
+            const level_name = std.fmt.bufPrintSentinel(&level_buf, "zdb_level_{d}", .{slot}, 0 ) catch continue;
             const print = dl.lookup(InspectFn, print_name) orelse continue;
             const level = dl.lookup(LevelFn, level_name) orelse continue;
             inspectors.put(gpa, want.cache_key, .{ .print = print, .level = level }) catch {};

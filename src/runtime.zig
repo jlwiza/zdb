@@ -338,8 +338,8 @@ fn runtimeType(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .type, .@"fn", .comptime_int, .comptime_float, .enum_literal => false,
         .@"struct" => |info| blk: {
-            inline for (info.fields) |field| {
-                if (field.is_comptime or !runtimeType(field.type)) break :blk false;
+            inline for (info.field_attrs, info.field_types) |field_attr, field_type| {
+                if (field_attr.@"comptime" or !runtimeType(field_type)) break :blk false;
             }
             break :blk true;
         },

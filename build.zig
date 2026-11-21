@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     // Generation loader: shared by zdb runtime and app script hot reload
     const gen_module = b.addModule("dylib_generation", .{
         .root_source_file = b.path("src/generation_loader.zig"),
+		.link_libc = true
     });
 
     // The library module

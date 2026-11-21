@@ -7,7 +7,8 @@ const gen = @import("gen.zig");
 // Global state for debugging
 pub var step_mode: bool = false;
 // FIXED: Now using a stack of functions instead of single function
-pub var step_functions: [32]?[]const u8 = [_]?[]const u8{null} ** 32;
+pub var step_functions: [32]?[]const u8 = @splat(null);
+// pub var step_functions: [32]?[]const u8 = [_]?[]const u8{null} ** 32;
 pub var step_function_count: usize = 0;
 var watch_expressions: []const WatchExpr = &.{};
 var breakpoint_count: usize = 0;
@@ -180,7 +181,7 @@ pub fn localRef(name: []const u8, ptr: anytype) sidecar_abi.LocalRef {
         .name_len = name.len,
         .type_name_ptr = type_name.ptr,
         .type_name_len = type_name.len,
-        .storage = if (pointer.is_const) .read_only_pointer else .mutable_pointer, // const local ⇒ &x is *const T
+        .storage = if (pointer.attrs.@"const") .read_only_pointer else .mutable_pointer, // const local ⇒ &x is *const T
         .bytes_ptr = @ptrCast(@constCast(ptr)),
         .bytes_len = @sizeOf(T),
     };
@@ -221,9 +222,9 @@ pub fn formatScalar(buf: []u8, type_name: []const u8, bytes: []const u8) ?[]cons
     if (shape.bits / 8 != bytes.len) return null; // u24 etc. pad to 4 bytes — leave for on-demand
     inline for (.{ 8, 16, 32, 64 }) |b| {
         if (b == shape.bits) {
-            const raw = std.mem.readInt(std.meta.Int(.unsigned, b), bytes[0 .. b / 8], native);
+            const raw = std.mem.readInt(@Int(.unsigned, b), bytes[0 .. b / 8], native);
             return if (shape.signed)
-                std.fmt.bufPrint(buf, "{d}", .{@as(std.meta.Int(.signed, b), @bitCast(raw))}) catch null
+                std.fmt.bufPrint(buf, "{d}", .{@as(@Int(.signed, b), @bitCast(raw))}) catch null
             else
                 std.fmt.bufPrint(buf, "{d}", .{raw}) catch null;
         }
@@ -337,8 +338,8 @@ fn runtimeType(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .type, .@"fn", .comptime_int, .comptime_float, .enum_literal => false,
         .@"struct" => |info| blk: {
-            inline for (info.fields) |field| {
-                if (field.is_comptime or !runtimeType(field.type)) break :blk false;
+            inline for (info.field_attrs, info.field_types) |field_attr, field_type| {
+                if (field_attr.@"comptime" or !runtimeType(field_type)) break :blk false;
             }
             break :blk true;
         },
@@ -784,7 +785,8 @@ fn debugPrintStructArray(items: anytype, start_index: usize, indent: usize) void
 
     const items_to_show = @min(items.len, page_items);
     const show_items = items[0..items_to_show];
-    var column_widths = [_]usize{3} ** page_items;
+    // var column_widths = [_]usize{3} ** page_items;
+	var column_widths: [page_items]usize = @splat(3);
     for (show_items, 0..) |item, column| {
         inline for (fields, 0..) |field, field_index| {
             if (field_index >= max_struct_fields) continue;
@@ -1194,7 +1196,7 @@ test "locals capture preserves pointers and normalizes comptime values" {
 }
 
 test "locals capture references large values without copying them" {
-    var value = [_]u8{7} ** 4096;
+    var value: [4096]u8 = @splat(7);
     const captured = captureRef(&value);
     try std.testing.expect(captured.ptr == &value);
     captured.ptr[0] = 9;

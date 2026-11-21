@@ -104,7 +104,7 @@ fn calleeNames(allocator: std.mem.Allocator, ast: *const Ast, body: Node.Index) 
 /// Index one file: every redirectable decl-level function, with the same path
 /// and id the preprocessor gives its wrapper.
 pub fn indexFile(allocator: std.mem.Allocator, file: []const u8, source: [:0]const u8) error{OutOfMemory}![]Function {
-    var ast = try Ast.parse(allocator, source, .zig);
+    var ast = try Ast.parse(allocator, source, .{ .mode = .zig });
     defer ast.deinit(allocator);
     var out: std.ArrayList(Function) = .empty;
     if (ast.errors.len != 0) return out.toOwnedSlice(allocator);

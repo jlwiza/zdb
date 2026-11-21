@@ -23,7 +23,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, args[1], allocator, .limited(10 * 1024 * 1024));
 	const source_z = try allocator.dupeSentinel(u8, source, 0);
     // const source_z = try allocator.dupeZ(u8, source);
-    var ast = try Ast.parse(allocator, source_z, .zig);
+	var ast = try Ast.parse(allocator, source_z, .{ .mode = .zig });
+    // var ast = try Ast.parse(allocator, source_z, .zig);
     defer ast.deinit(allocator);
     if (ast.errors.len != 0) return error.InvalidSource;
 

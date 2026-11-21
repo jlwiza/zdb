@@ -222,9 +222,9 @@ pub fn formatScalar(buf: []u8, type_name: []const u8, bytes: []const u8) ?[]cons
     if (shape.bits / 8 != bytes.len) return null; // u24 etc. pad to 4 bytes — leave for on-demand
     inline for (.{ 8, 16, 32, 64 }) |b| {
         if (b == shape.bits) {
-            const raw = std.mem.readInt(std.meta.Int(.unsigned, b), bytes[0 .. b / 8], native);
+            const raw = std.mem.readInt(@Int(.unsigned, b), bytes[0 .. b / 8], native);
             return if (shape.signed)
-                std.fmt.bufPrint(buf, "{d}", .{@as(std.meta.Int(.signed, b), @bitCast(raw))}) catch null
+                std.fmt.bufPrint(buf, "{d}", .{@as(@Int(.signed, b), @bitCast(raw))}) catch null
             else
                 std.fmt.bufPrint(buf, "{d}", .{raw}) catch null;
         }

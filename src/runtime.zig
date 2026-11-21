@@ -7,7 +7,8 @@ const gen = @import("gen.zig");
 // Global state for debugging
 pub var step_mode: bool = false;
 // FIXED: Now using a stack of functions instead of single function
-pub var step_functions: [32]?[]const u8 = [_]?[]const u8{null} ** 32;
+pub var step_functions: [32]?[]const u8 = @splat(null);
+// pub var step_functions: [32]?[]const u8 = [_]?[]const u8{null} ** 32;
 pub var step_function_count: usize = 0;
 var watch_expressions: []const WatchExpr = &.{};
 var breakpoint_count: usize = 0;
@@ -784,7 +785,8 @@ fn debugPrintStructArray(items: anytype, start_index: usize, indent: usize) void
 
     const items_to_show = @min(items.len, page_items);
     const show_items = items[0..items_to_show];
-    var column_widths = [_]usize{3} ** page_items;
+    // var column_widths = [_]usize{3} ** page_items;
+	var column_widths: [page_items]usize = @splat(3);
     for (show_items, 0..) |item, column| {
         inline for (fields, 0..) |field, field_index| {
             if (field_index >= max_struct_fields) continue;
@@ -1194,7 +1196,7 @@ test "locals capture preserves pointers and normalizes comptime values" {
 }
 
 test "locals capture references large values without copying them" {
-    var value = [_]u8{7} ** 4096;
+    var value: [4096]u8 = @splat(7);
     const captured = captureRef(&value);
     try std.testing.expect(captured.ptr == &value);
     captured.ptr[0] = 9;
